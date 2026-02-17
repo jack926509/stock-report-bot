@@ -428,4 +428,4 @@ console.log(`║  模型：GPT-4o`);
 console.log(`║  資料：Yahoo Finance (即時)`);
 console.log(`║  目標：Telegram ${CHAT_ID}`);
 console.log('╚══════════════════════════════════════╝');
-generateAndSend();
+
