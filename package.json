@@ -1,13 +1,14 @@
 {
   "name": "stock-report-bot",
-  "version": "1.0.0",
-  "description": "美股日報 Telegram 自動推送",
+  "version": "2.0.0",
+  "description": "美股日報 Telegram 自動推送 — 含即時股價",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "node-cron": "^3.0.3",
-    "openai": "^4.77.0"
+    "node-cron":      "^3.0.3",
+    "openai":         "^4.77.0",
+    "yahoo-finance2": "^3.3.0"
   }
 }
