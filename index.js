@@ -326,69 +326,107 @@ function buildPrompt(marketData) {
 
 ${dataSection}
 
-=== 報告撰寫要求 ===
+════════════════════════════════
+報告撰寫要求
+════════════════════════════════
 
-請依照以下格式，用繁體中文撰寫適合 Telegram 閱讀的市場日報：
+請用繁體中文撰寫，輸出格式必須是 Telegram HTML（僅限 <b>、<i>、<code>、<pre> 標籤）。
 
-1. 📊 三大指數總覽
-   - 直接引用上方真實數字
-   - 指出今日市場的整體氛圍（風險偏好 / 規避）
-   - 指數之間是否出現分化（例如道瓊漲但那斯達克跌）
-   - VIX 對應解讀（恐慌升溫 / 趨於平靜）
+嚴格禁止輸出：
+✗ Markdown（**粗體**、# 標題、--- 分隔線）
+✗ 任何在 Telegram HTML 模式下不合法的標籤
+✗ 開頭或結尾加上多餘的說明文字（直接輸出報告本文）
 
-2. 🔮 七巨頭動態
-   - 直接引用上方真實數字
-   - 點出今日最強 / 最弱的巨頭
-   - 成交量異常（均量倍數高）的個股特別標記
-   - 分析巨頭集體走勢對大盤的意涵
+────────────────────────────────
+報告結構與格式範本
+────────────────────────────────
 
-3. 🔥 昨日焦點個股（依產業分類）
-   ★ 這是本報告的核心重點，請花最多篇幅 ★
+【第一段：三大指數總覽】
+輸出格式範本：
+<b>📊 三大指數總覽</b>
+▸ <b>S&P 500</b>：6,882.72（▲35.09 / <b>+0.51%</b>）
+▸ <b>道瓊工業</b>：43,461.21（▲247.15 / <b>+0.57%</b>）
+▸ <b>那斯達克</b>：21,574.86（▲115.33 / <b>+0.54%</b>）
+▸ <b>VIX 恐慌指數</b>：17.23（▼1.05）→ 恐慌情緒趨緩，市場風險偏好回升
 
-   從「各產業個股數據」中，依照以下篩選邏輯，每個有亮點的產業各挑出 1–3 支焦點個股：
+<i>[一段話：今日整體氛圍，指數之間是否分化，VIX 解讀]</i>
 
-   【篩選優先順序】
-   a. 漲跌幅絕對值 > 3%（明顯異動）
-   b. 成交量為均量 2 倍以上（資金大舉進出）
-   c. 接近 52 週高點（突破嘗試）或大幅偏離高點（超跌反彈機會）
-   d. 同產業內相對強弱明顯（一枝獨秀或一隻黑羊）
-   e. 結合你的知識，判斷該個股是否有近期催化劑（財報、升評、併購傳聞等）
+【第二段：七巨頭動態】
+輸出格式範本：
+<b>🔮 七巨頭動態</b>
+🥇 最強：<b>Nvidia（NVDA）</b> $875.43 <b>+3.21%</b>｜量能爆發 2.8x 均量
+🥉 最弱：<b>Tesla（TSLA）</b> $248.10 <b>-2.14%</b>
+▸ Apple $198.20 +0.41%
+▸ Microsoft $415.32 +0.89%
+▸ Alphabet $172.45 +0.63%
+▸ Amazon $196.78 +1.12%
+▸ Meta $551.20 +0.74%
 
-   【每支焦點個股撰寫格式】
-   📌 產業標籤｜股票名稱（代碼）
-   ─ 昨日表現：價格、漲跌幅、成交量異常倍數
-   ─ 焦點原因：為何值得關注？（一句話核心理由）
-   ─ 背景補充：近期業務進展、同業比較、產業趨勢
-   ─ 後市觀察：支撐位 / 阻力位，短線留意事項
+<i>[一段話：巨頭整體偏多/偏空，對大盤的意涵，量能異常個股點評]</i>
 
-   【注意】若某產業當日無明顯亮點，請直接跳過，不需強行湊數。
-   重點是真正有異動的個股，不必每個產業都出現。
+【第三段：昨日焦點個股】★ 本報告篇幅最重的區塊 ★
+篩選邏輯（依優先順序）：
+  a. 漲跌幅絕對值 > 3%
+  b. 成交量 ≥ 均量 2 倍
+  c. 接近或突破 52 週高點，或大幅超跌
+  d. 同產業內相對強弱分化明顯
+  e. 結合你的知識判斷近期催化劑（財報、升評、併購傳聞等）
 
-4. 📰 今日宏觀背景
-   - Fed 政策立場、近期 CPI / PCE / 就業數據走勢
-   - 重要企業財報或公告（若有）
-   - 地緣政治、匯率、原油等外部因素
+每支焦點個股輸出格式範本：
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+📌 <b>[產業標籤]｜[股票名稱]（[代碼]）</b>
+💰 <b>$[價格]</b>　[漲跌emoji] <b>[漲跌幅]</b>　📦 量能 <b>[均量倍數]x</b>
+🔍 <b>焦點：</b>[一句話核心原因]
+📋 <b>背景：</b>[近期業務進展 / 同業比較 / 產業趨勢，2–3 句]
+🎯 <b>後市：</b>支撐 <code>$[價格]</code>，阻力 <code>$[價格]</code>，[短線留意事項]
 
-5. 🔄 產業輪動觀察
-   - 今日哪些板塊領漲 / 領跌
-   - 資金從哪裡流向哪裡
-   - 防禦型 vs 成長型板塊的強弱對比
+注意：若某產業當日無明顯亮點，直接跳過該產業，不需強行湊數。
 
-6. 🎯 後市三情境展望
-   - 多頭情境：支撐條件 + 近期目標位
-   - 空頭情境：觸發風險 + 關鍵支撐位
-   - 中性情境：盤整區間
+輸出範本：
+<b>🔥 昨日焦點個股</b>
 
-7. ⚠️ 本週風險雷達
-   - 本週還有哪些重要數據公布（Fed 會議、財報週等）
-   - 技術面警示
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+📌 <b>記憶體／半導體｜Micron（MU）</b>
+💰 <b>$112.45</b>　🚀 <b>+5.82%</b>　📦 量能 <b>3.1x</b>
+🔍 <b>焦點：</b>HBM 出貨量超預期，AI 伺服器需求帶動業績上修
+📋 <b>背景：</b>Q2 財報預期優於市場，SK Hynix 漲勢外溢，DRAM 現貨價回升趨勢確立。
+🎯 <b>後市：</b>支撐 <code>$108</code>，阻力 <code>$118</code>，留意費半指數同步性
 
-【格式規範】
-- 直接用真實數字，不要說「根據上方數據」
-- 數字要帶千位符號和漲跌方向符號：S&P 500: 6,882.72（▲35.09 / +0.51%）
-- 章節標題用 emoji 加粗體感
-- 焦點個股區塊請特別突出，是讀者最想看的部分
-- 最後加：⚠️ 免責聲明：本報告由 AI 自動生成，數據來源 Yahoo Finance，僅供參考，不構成投資建議。`;
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+📌 <b>低軌道衛星／太空｜Rocket Lab（RKLB）</b>
+💰 <b>$23.18</b>　🟢 <b>+4.33%</b>　📦 量能 <b>2.4x</b>
+🔍 <b>焦點：</b>Neutron 火箭進度披露，衛星製造訂單創新高
+📋 <b>背景：</b>…
+🎯 <b>後市：</b>…
+
+【第四段：宏觀背景】
+<b>📰 今日宏觀背景</b>
+▸ <b>Fed：</b>[當前立場，近期發言重點]
+▸ <b>數據：</b>[近期 CPI / PCE / 就業數據關鍵數字]
+▸ <b>財報：</b>[昨日重要財報結果，若無則寫「本日無重大財報」]
+▸ <b>外部因素：</b>[地緣、匯率、油價等關鍵動態]
+
+【第五段：產業輪動】
+<b>🔄 產業輪動觀察</b>
+🟢 <b>領漲板塊：</b>[板塊名稱] — [原因]
+🔴 <b>領跌板塊：</b>[板塊名稱] — [原因]
+💸 <b>資金流向：</b>[從哪流向哪，防禦 vs 成長的強弱]
+
+【第六段：後市三情境】
+<b>🎯 後市三情境展望</b>
+🟩 <b>多頭情境：</b>[支撐條件]，目標 <code>[點位]</code>
+🟥 <b>空頭情境：</b>[觸發條件]，關鍵支撐 <code>[點位]</code>
+🟨 <b>中性情境：</b>區間震盪 <code>[低點]–[高點]</code>
+
+【第七段：風險雷達】
+<b>⚠️ 本週風險雷達</b>
+▸ [日期]：[重要事件，例如 Fed 會議、CPI 公布、大型財報]
+▸ [日期]：[重要事件]
+▸ <b>技術警示：</b>[關鍵支撐或超買超賣訊號]
+
+────────────────────────────────
+最後一行固定輸出（不可省略）：
+<i>⚠️ 本報告由 AI 自動生成，數據來源 Yahoo Finance，僅供參考，不構成投資建議。</i>`;
 }
 
 // ─────────────────────────────────────────────
@@ -405,7 +443,14 @@ async function callOpenAI(prompt, retries = 3) {
         messages: [
           {
             role:    'system',
-            content: '你是資深美股分析師，擅長根據真實市場數據撰寫清晰易讀的市場分析報告。報告要有具體數字，有洞察，有行動指引，不要空泛。在昨日焦點個股環節，只挑出真正有異動或值得關注的個股，寧缺毋濫，不需每個產業都有代表。',
+            content: `你是資深美股分析師，同時精通 Telegram HTML 排版。
+
+撰寫規則：
+1. 輸出格式：只能使用 Telegram 支援的 HTML 標籤（<b>、<i>、<code>、<pre>），禁止任何 Markdown 語法
+2. 數字要精確：直接引用資料數字，帶千位符號與漲跌符號（▲▼）
+3. 焦點個股：只挑真正有異動或催化劑的個股，寧缺毋濫，無亮點的產業直接跳過
+4. 文字風格：簡潔有力，適合早晨快速瀏覽，避免廢話和重複說明
+5. 數字保留兩位小數，百分比前加 + 或 -，價格前加 $`,
           },
           { role: 'user', content: prompt }
         ],
@@ -479,23 +524,44 @@ async function sendToTelegram(text) {
 }
 
 // ─────────────────────────────────────────────
-// 切分長訊息
+// 切分長訊息（依章節標題斷點，保持每段完整）
 // ─────────────────────────────────────────────
 function splitMessage(text, maxLen = 3800) {
-  const chunks     = [];
-  const paragraphs = text.split('\n\n');
-  let current      = '';
+  // 章節標題識別（以 emoji 開頭的 <b> 標籤行）
+  const SECTION_RE = /(?=\n<b>[📊🔮🔥📰🔄🎯⚠️])/g;
 
-  for (const para of paragraphs) {
-    const candidate = current ? current + '\n\n' + para : para;
+  // 先嘗試依章節切分
+  const sections = text.split(SECTION_RE);
+  const chunks   = [];
+  let current    = '';
+
+  for (const section of sections) {
+    const candidate = current + section;
     if (candidate.length <= maxLen) {
       current = candidate;
     } else {
-      if (current) chunks.push(current);
-      current = para.length <= maxLen ? para : para.slice(0, maxLen);
+      if (current.trim()) chunks.push(current.trim());
+      // 單一章節超過 maxLen 時，再按段落切
+      if (section.length > maxLen) {
+        const paras = section.split('\n\n');
+        let sub = '';
+        for (const p of paras) {
+          const c2 = sub ? sub + '\n\n' + p : p;
+          if (c2.length <= maxLen) {
+            sub = c2;
+          } else {
+            if (sub.trim()) chunks.push(sub.trim());
+            sub = p.slice(0, maxLen);
+          }
+        }
+        current = sub;
+      } else {
+        current = section;
+      }
     }
   }
-  if (current) chunks.push(current);
+  if (current.trim()) chunks.push(current.trim());
+
   return chunks;
 }
 
@@ -543,10 +609,28 @@ async function generateAndSend() {
     console.log(`  ✅ 報告生成完成（${report.length} 字）`);
 
     // Step 3：組裝完整訊息
-    const dateStr    = new Date().toLocaleDateString('zh-TW');
-    const weekday    = new Date().toLocaleDateString('zh-TW', { weekday: 'long' });
-    const header     = `📈 <b>美股日報｜${dateStr} ${weekday}</b>\n${'─'.repeat(24)}\n\n`;
-    const footer     = `\n\n${'─'.repeat(24)}\n🤖 AI 生成 · 數據來源 Yahoo Finance · 僅供參考`;
+    const now      = new Date();
+    const dateStr  = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
+    const weekday  = now.toLocaleDateString('zh-TW', { weekday: 'long' });
+    const timeStr  = now.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+
+    // 計算指數概況做為副標題摘要
+    const spx    = marketData.indices.find(x => x.symbol === '^GSPC');
+    const vix    = marketData.indices.find(x => x.symbol === '^VIX');
+    const spxStr = spx?.quote ? `S&P ${spx.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(spx.quote.changePct).toFixed(2)}%` : '';
+    const vixStr = vix?.quote ? `VIX ${fmt(vix.quote.price)}` : '';
+    const summary = [spxStr, vixStr].filter(Boolean).join('　');
+
+    const header = `<b>📈 美股日報｜${dateStr} ${weekday}</b>
+<i>${summary}　${timeStr} 發布</i>
+${'─'.repeat(28)}
+
+`;
+    const footer = `
+
+${'─'.repeat(28)}
+<i>🤖 GPT-4o 生成 · 數據來源 Yahoo Finance · 僅供參考</i>`;
+
     const fullReport = header + report + footer;
 
     // Step 4：分段發送
@@ -555,10 +639,19 @@ async function generateAndSend() {
 
     let successCount = 0;
     for (let i = 0; i < chunks.length; i++) {
-      const result = await sendToTelegram(chunks[i]);
+      // 多段時在每段末尾加提示（第一段不加，最後一段不加「待續」）
+      let msg = chunks[i];
+      if (chunks.length > 1) {
+        if (i < chunks.length - 1) {
+          msg += `\n\n<i>── 第 ${i + 1} / ${chunks.length} 段，續下則 ──</i>`;
+        } else {
+          msg += `\n\n<i>── 第 ${i + 1} / ${chunks.length} 段（完）──</i>`;
+        }
+      }
+      const result = await sendToTelegram(msg);
       if (result.ok) successCount++;
       console.log(`    段落 ${i + 1}/${chunks.length} → ✅ message_id: ${result.messageId}`);
-      if (i < chunks.length - 1) await sleep(1200);
+      if (i < chunks.length - 1) await sleep(1500);
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
