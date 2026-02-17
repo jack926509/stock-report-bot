@@ -1,1 +1,13 @@
-{ "name": "stock-report-bot", "version": "1.0.0", "description": "美股日報 Telegram 自動推送", "main": "index.js", "scripts": { "start": "node index.js" }, "dependencies": { "node-cron": "^3.0.3", "openai": "^4.77.0" } }
+{
+  "name": "stock-report-bot",
+  "version": "1.0.0",
+  "description": "美股日報 Telegram 自動推送",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "openai": "^4.77.0"
+  }
+}
