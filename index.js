@@ -14,7 +14,7 @@ const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID    = process.env.TELEGRAM_CHAT_ID;
 
 // ── 排程：台北時間 週一到五 早上 09:30
-const SCHEDULE = '30 9 * * 1-5';
+const SCHEDULE = '30 7 * * 1-5';
 const TIMEZONE = 'Asia/Taipei';
 
 // ── 報告生成 Prompt
