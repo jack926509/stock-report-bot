@@ -180,3 +180,6 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 cron.schedule(SCHEDULE, generateAndSend, { timezone: TIMEZONE });
 console.log(`✅ 排程已啟動：台北時間週一至週五 09:30 自動執行`);
 console.log(`🕒 伺服器時間：${new Date().toLocaleString('zh-TW')}`);
+
+// ↑ 上面是原本的程式碼（保留不動） // ── 加上這行：啟動時立刻執行一次（測試用） 
+generateAndSend();
