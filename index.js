@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════
 // 美股日報機器人 v1.0
-// 每天台北時間早上 09:30（週一～五）自動執行
+// 每天台北時間早上 07:30（週一～五）自動執行
 // 使用 OpenAI GPT-4o-mini 生成報告並推送到 Telegram
 // ═══════════════════════════════════════════════════
 
@@ -73,7 +73,7 @@ async function generateAndSend() {
     // 1. 呼叫 OpenAI API
     const openai = new OpenAI({ apiKey: OPENAI_KEY });
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',   // 省錢版；換 gpt-4o 品質更好
+      model: 'gpt-4o',   // 省錢版；換 gpt-4o 品質更好
       messages: [
         {
           role: 'system',
