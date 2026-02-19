@@ -1077,12 +1077,12 @@ cron.schedule(SCHEDULE, generateAndSend, { timezone: TIMEZONE });
 
 const totalStocks = Object.values(SECTOR_STOCKS).flat().length;
 console.log('╔══════════════════════════════════════════════════════╗');
-console.log('║  美股日報機器人 v4.0  已啟動                          ║');
+console.log('║  美股日報機器人 v4.1  已啟動                          ║');
 console.log('╠══════════════════════════════════════════════════════╣');
 console.log(`║  排程  ：${SCHEDULE} (${TIMEZONE})         ║`);
 console.log(`║  模型  ：GPT-4o                                       ║`);
 console.log(`║  股價  ：Yahoo Finance（即時）                        ║`);
 console.log(`║  新聞  ：Finnhub ${FINNHUB_KEY ? '✅ 已啟用' : '❌ 未設定（功能停用）'}                      ║`);
 console.log(`║  個股池：${Object.keys(SECTOR_STOCKS).length} 大產業 / ${totalStocks} 支個股                        ║`);
-console.log(`║  新功能：排行榜 + 財報日曆 + 真實新聞背景              ║`);
+console.log(`║  技術指標：RSI(14) / MA20 / MA50 / 布林通道          ║`);
 console.log('╚══════════════════════════════════════════════════════╝');
