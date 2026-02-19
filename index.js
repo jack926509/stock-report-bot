@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報機器人 v4.1
+// 美股日報機器人 v4.2
 // ─── 沿用 v3.0 功能 ─────────────────────────────────────
 //   ① Yahoo Finance 即時股價
 //   ② 非交易日自動跳過
@@ -22,6 +22,10 @@
 //       指標注入 GPT Prompt，並顯示於 Telegram 排行榜
 //   ⑯  yahoo-finance2 v3 API 升級修正（new YahooFinance()）
 //   ⑰  Finnhub 股票報價備援 + 8 秒請求逾時保護
+// ─── v4.2 財經新聞分析 ──────────────────────────────────
+//   ⑱  fetchKeyStockNews()：批次抓取 MAG7 + 當日漲跌前三名個股新聞
+//   ⑲  GPT 報告新增「🗞️ 財經新聞分析」章節（第八章）
+//       每則新聞結合當日股價表現，說明市場如何消化該消息
 // ═══════════════════════════════════════════════════════════
 
 const OpenAI       = require('openai');
@@ -60,6 +64,12 @@ const FINNHUB_KEY   = process.env.FINNHUB_API_KEY || null;
 // ─────────────────────────────────────────────
 const SCHEDULE = '30 7 * * 1-5';   // 台北時間週一至週五 07:30
 const TIMEZONE = 'Asia/Taipei';
+
+// ─────────────────────────────────────────────
+// 新聞抓取上限設定
+// ─────────────────────────────────────────────
+const NEWS_MARKET_LIMIT = 20;   // 宏觀市場新聞最多幾條（fetchFinnhubNews）
+const NEWS_STOCK_LIMIT  = 3;    // 每支個股新聞最多幾條（fetchStockNews）
 
 // ─────────────────────────────────────────────
 // 指數清單
@@ -215,7 +225,7 @@ function fetchFinnhubNews() {
           // 只取標題，過濾掉雜訊，最多 20 條
           const headlines = articles
             .filter(a => a.headline && a.headline.length > 10)
-            .slice(0, 20)
+            .slice(0, NEWS_MARKET_LIMIT)
             .map(a => `• ${a.headline}`);
 
           console.log(`  ✅ 取得 ${headlines.length} 條市場新聞標題`);
@@ -249,11 +259,45 @@ function fetchStockNews(symbol) {
         try {
           const articles = JSON.parse(data);
           if (!Array.isArray(articles)) { resolve([]); return; }
-          resolve(articles.slice(0, 3).map(a => a.headline).filter(Boolean));
+          resolve(articles.slice(0, NEWS_STOCK_LIMIT).map(a => a.headline).filter(Boolean));
         } catch { resolve([]); }
       });
     }).on('error', () => resolve([]));
   });
+}
+
+// ─────────────────────────────────────────────
+// 批次抓取重點個股新聞（MAG7 + 當日漲跌幅前後三名）
+// 回傳 Map：{ symbol → { name, headlines[] } }
+// ─────────────────────────────────────────────
+async function fetchKeyStockNews(marketData) {
+  if (!FINNHUB_KEY) return {};
+
+  // 產業池個股依漲跌幅排序，取前 3 / 後 3
+  const allSectorStocks = Object.values(marketData.sectorStocks).flat();
+  const sorted = [...allSectorStocks]
+    .filter(s => s.quote?.changePct != null)
+    .sort((a, b) => b.quote.changePct - a.quote.changePct);
+  const topMovers = [
+    ...sorted.slice(0, 3),   // 漲幅前三
+    ...sorted.slice(-3),     // 跌幅前三
+  ];
+
+  // MAG7 + 大幅異動個股（去重）
+  const targets = new Map();
+  for (const s of MAG7)      targets.set(s.symbol, s.name);
+  for (const s of topMovers) targets.set(s.symbol, s.name);
+
+  const newsMap = {};
+  for (const [symbol, name] of targets) {
+    const headlines = await fetchStockNews(symbol);
+    if (headlines.length > 0) newsMap[symbol] = { name, headlines };
+    await sleep(300);  // 避免 Finnhub 限速（60 次/分）
+  }
+
+  const total = Object.values(newsMap).reduce((a, v) => a + v.headlines.length, 0);
+  console.log(`  ✅ 取得 ${Object.keys(newsMap).length} 支個股新聞（共 ${total} 條）`);
+  return newsMap;
 }
 
 // ─────────────────────────────────────────────
@@ -683,24 +727,34 @@ function buildMarketDataSection(marketData) {
 // ─────────────────────────────────────────────
 // 組裝完整 Prompt（v4.0 修正版）
 // ─────────────────────────────────────────────
-function buildPrompt(marketData, newsHeadlines) {
+function buildPrompt(marketData, newsHeadlines, stockNewsMap = {}) {
   const today = new Date().toLocaleDateString('zh-TW', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
   });
 
   const dataSection = buildMarketDataSection(marketData);
 
-  // ⑭ 新聞區塊：有新聞就貼真實標題，沒有就明確告知
+  // ⑭ 宏觀新聞區塊
   const newsSection = newsHeadlines.length > 0
     ? `=== 今日財經新聞標題（昨日真實頭條，請據此推論市場背景）===\n${newsHeadlines.join('\n')}`
     : `=== 今日財經新聞 ===\n（本日新聞資料未取得，宏觀背景段落請只描述市場氛圍和整體趨勢，不要引用任何具體數字或事件名稱）`;
+
+  // 個股新聞區塊（供章節八「財經新聞分析」使用）
+  let stockNewsSection = '';
+  if (Object.keys(stockNewsMap).length > 0) {
+    stockNewsSection = '\n=== 重點個股新聞（昨日真實標題，供財經新聞分析章節使用）===\n';
+    for (const [symbol, { name, headlines }] of Object.entries(stockNewsMap)) {
+      stockNewsSection += `\n【${name}（${symbol}）】\n`;
+      headlines.forEach(h => { stockNewsSection += `• ${h}\n`; });
+    }
+  }
 
   return `你是專業的美股市場分析師，以下是今天（${today}）的真實市場數據，請撰寫完整的美股市場日報。
 
 ${dataSection}
 
 ${newsSection}
-
+${stockNewsSection}
 ════════════════════════════════════════
 報告撰寫要求
 ════════════════════════════════════════
@@ -818,6 +872,30 @@ ${newsSection}
 ▸ <b>本週整體關注：</b>[一句話說明本週最大的不確定性來源]
 
 ────────────────────────────────────────
+章節八｜🗞️ 財經新聞分析
+────────────────────────────────────────
+【規則】
+- 從上方「重點個股新聞」中挑選 3～5 則最具市場影響力的新聞
+- 若無個股新聞，則從「今日財經新聞標題」中挑選重要條目
+- 若完全無新聞資料，輸出：「今日無重大財經新聞可分析」
+- 每則新聞須結合當日實際股價表現，說明市場如何消化該消息
+
+格式範本：
+
+<b>🗞️ 財經新聞分析</b>
+
+📌 <b>[新聞重點摘要（15 字以內）]</b>
+▸ <b>相關個股：</b>[名稱（代碼）] [當日漲跌幅]
+▸ <b>市場解讀：</b>[一句話說明新聞對股價或板塊的實際影響及市場反應]
+
+（重複輸出 3～5 則，以重要性排序）
+
+【⚠️ 禁止事項】
+✗ 不可捏造未在新聞標題中出現的具體事件或數字
+✗ 不可引用過去歷史財報數字（除非標題明確提及）
+✓ 只根據提供的真實標題推論，不確定的事不寫
+
+────────────────────────────────────────
 最後一行固定輸出（不可省略、不可修改）：
 <i>⚠️ 本報告由 AI 自動生成，數據來源 Yahoo Finance / Finnhub，僅供參考，不構成投資建議。</i>`;
 }
@@ -916,7 +994,7 @@ async function sendToTelegram(text) {
 // 切分長訊息（依章節 emoji 斷點）
 // ─────────────────────────────────────────────
 function splitMessage(text, maxLen = 3800) {
-  const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️])/g;
+  const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️🗞️])/g;
   const sections   = text.split(SECTION_RE);
   const chunks     = [];
   let current      = '';
@@ -974,7 +1052,7 @@ async function generateAndSend() {
   if (!isTradingDay()) return;
 
   try {
-    // Step 1：並行抓取市場資料 + 新聞
+    // Step 1：並行抓取市場資料 + 宏觀新聞
     console.log('📡 並行取得市場資料與新聞...');
     const [marketData, newsHeadlines] = await Promise.all([
       fetchAllMarketData(),
@@ -1000,12 +1078,16 @@ async function generateAndSend() {
       return;
     }
 
+    // Step 1b：抓取重點個股新聞（MAG7 + 當日大幅異動個股）
+    console.log('📰 抓取重點個股新聞...');
+    const stockNewsMap = await fetchKeyStockNews(marketData);
+
     // Step 2：程式計算排行榜與財報日曆（不靠 GPT）
     const rankingSection  = buildRankingSection(marketData);
     const earningsSection = buildEarningsSection(marketData);
 
     // Step 3：生成 GPT 報告
-    const prompt = buildPrompt(marketData, newsHeadlines);
+    const prompt = buildPrompt(marketData, newsHeadlines, stockNewsMap);
     const report = await callOpenAI(prompt);
     console.log(`  ✅ GPT 報告完成（${report.length} 字）`);
 
@@ -1077,12 +1159,25 @@ cron.schedule(SCHEDULE, generateAndSend, { timezone: TIMEZONE });
 
 const totalStocks = Object.values(SECTOR_STOCKS).flat().length;
 console.log('╔══════════════════════════════════════════════════════╗');
-console.log('║  美股日報機器人 v4.0  已啟動                          ║');
+console.log('║  美股日報機器人 v4.2  已啟動                          ║');
 console.log('╠══════════════════════════════════════════════════════╣');
 console.log(`║  排程  ：${SCHEDULE} (${TIMEZONE})         ║`);
 console.log(`║  模型  ：GPT-4o                                       ║`);
 console.log(`║  股價  ：Yahoo Finance（即時）                        ║`);
 console.log(`║  新聞  ：Finnhub ${FINNHUB_KEY ? '✅ 已啟用' : '❌ 未設定（功能停用）'}                      ║`);
 console.log(`║  個股池：${Object.keys(SECTOR_STOCKS).length} 大產業 / ${totalStocks} 支個股                        ║`);
-console.log(`║  新功能：排行榜 + 財報日曆 + 真實新聞背景              ║`);
+console.log(`║  技術指標：RSI(14) / MA20 / MA50 / 布林通道          ║`);
+console.log(`║  財經新聞分析：MAG7 + 當日大幅異動個股新聞           ║`);
+console.log(`║  新聞上限：宏觀 ${String(NEWS_MARKET_LIMIT).padEnd(2)} 條 ／ 每支個股 ${NEWS_STOCK_LIMIT} 條               ║`);
 console.log('╚══════════════════════════════════════════════════════╝');
+
+// ─────────────────────────────────────────────
+// RUN_NOW 即時觸發模式（測試用）
+// 在 Zeabur 設定環境變數 RUN_NOW=true 並重啟服務即可立即發送一次報告
+// 測試完畢後請移除該環境變數，避免每次重啟都觸發
+// ─────────────────────────────────────────────
+if (process.env.RUN_NOW === 'true') {
+  console.log('⚡ RUN_NOW 模式：立即執行一次報告生成...');
+  console.log('⚠️  測試完成後請在 Zeabur 移除 RUN_NOW 環境變數');
+  generateAndSend();
+}
