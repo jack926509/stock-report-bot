@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報機器人 v4.0
+// 美股日報機器人 v4.1
 // ─── 沿用 v3.0 功能 ─────────────────────────────────────
 //   ① Yahoo Finance 即時股價
 //   ② 非交易日自動跳過
@@ -16,12 +16,19 @@
 //   ⑫  移除 GPT 偽支撐/阻力位 → 改為真實「後市關注點」
 //   ⑬  修正矛盾篇幅指令（最多 5 支焦點個股，無亮點可為 0）
 //   ⑭  宏觀背景改引用今日真實新聞標題，禁止 GPT 引用舊數字
+// ─── v4.1 技術指標引擎 ──────────────────────────────────
+//   ⑮  RSI(14)、MA20、MA50、布林通道（程式計算，真實數據）
+//       計算對象：MAG7 + 指數 + 當日漲跌幅前後各 10 名個股
+//       指標注入 GPT Prompt，並顯示於 Telegram 排行榜
+//   ⑯  yahoo-finance2 v3 API 升級修正（new YahooFinance()）
+//   ⑰  Finnhub 股票報價備援 + 8 秒請求逾時保護
 // ═══════════════════════════════════════════════════════════
 
 const OpenAI       = require('openai');
 const cron         = require('node-cron');
 const https        = require('https');
-const yahooFinance = require('yahoo-finance2').default;
+const YahooFinance = require('yahoo-finance2').default;
+const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -250,31 +257,107 @@ function fetchStockNews(symbol) {
 }
 
 // ─────────────────────────────────────────────
-// Yahoo Finance 報價
+// Finnhub 股票報價備援（Yahoo Finance 失敗時使用）
+// GET /api/v1/quote?symbol=AAPL&token=KEY
+// c=現價 d=漲跌 dp=漲跌% h=最高 l=最低 o=開盤 pc=前收
+// ─────────────────────────────────────────────
+function fetchQuoteFromFinnhub(symbol) {
+  return new Promise((resolve) => {
+    if (!FINNHUB_KEY) { resolve(null); return; }
+    const path = `/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
+    https.get({ hostname: 'finnhub.io', path }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const q = JSON.parse(data);
+          // c === 0 代表找不到該 symbol 或盤後無資料
+          if (!q || q.c == null || q.c === 0) { resolve(null); return; }
+          resolve({
+            symbol,
+            price:            q.c,
+            change:           q.d   ?? null,
+            changePct:        q.dp  ?? null,
+            prevClose:        q.pc  ?? null,
+            open:             q.o   ?? null,
+            high:             q.h   ?? null,
+            low:              q.l   ?? null,
+            volume:           null,        // Finnhub 免費版無成交量
+            avgVolume:        null,
+            marketCap:        null,
+            fiftyTwoWeekHigh: null,
+            fiftyTwoWeekLow:  null,
+            earningsDate:     null,
+            shortName:        symbol,
+            _source:          'Finnhub',  // 標記備援來源
+          });
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// ─────────────────────────────────────────────
+// Yahoo Finance 報價（8 秒逾時 + Finnhub 備援）
 // ─────────────────────────────────────────────
 async function fetchQuote(symbol) {
+  // ── 嘗試 Yahoo Finance（8 秒逾時）──
   try {
-    const q = await yahooFinance.quote(symbol, {}, { validateResult: false });
-    return {
-      symbol,
-      price:            q.regularMarketPrice,
-      change:           q.regularMarketChange,
-      changePct:        q.regularMarketChangePercent,
-      prevClose:        q.regularMarketPreviousClose,
-      open:             q.regularMarketOpen,
-      high:             q.regularMarketDayHigh,
-      low:              q.regularMarketDayLow,
-      volume:           q.regularMarketVolume,
-      avgVolume:        q.averageDailyVolume3Month,
-      marketCap:        q.marketCap,
-      fiftyTwoWeekHigh: q.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow:  q.fiftyTwoWeekLow,
-      earningsDate:     q.earningsTimestamp ?? q.earningsTimestampStart ?? null,
-      shortName:        q.shortName || symbol,
-    };
-  } catch (err) {
-    console.warn(`  ⚠️  無法取得 ${symbol} 報價：${err.message}`);
+    const quotePromise   = yahooFinance.quote(symbol, {}, { validateResult: false });
+    const timeoutPromise = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('Yahoo 請求逾時 8s')), 8000)
+    );
+    const q = await Promise.race([quotePromise, timeoutPromise]);
+
+    if (q?.regularMarketPrice != null) {
+      return {
+        symbol,
+        price:            q.regularMarketPrice,
+        change:           q.regularMarketChange,
+        changePct:        q.regularMarketChangePercent,
+        prevClose:        q.regularMarketPreviousClose,
+        open:             q.regularMarketOpen,
+        high:             q.regularMarketDayHigh,
+        low:              q.regularMarketDayLow,
+        volume:           q.regularMarketVolume,
+        avgVolume:        q.averageDailyVolume3Month,
+        marketCap:        q.marketCap,
+        fiftyTwoWeekHigh: q.fiftyTwoWeekHigh,
+        fiftyTwoWeekLow:  q.fiftyTwoWeekLow,
+        earningsDate:     q.earningsTimestamp ?? q.earningsTimestampStart ?? null,
+        shortName:        q.shortName || symbol,
+      };
+    }
+    throw new Error(`Yahoo 回傳空值 (price=${q?.regularMarketPrice})`);
+
+  } catch (yahooErr) {
+    // ── 備援：改用 Finnhub 免費報價 ──
+    if (FINNHUB_KEY) {
+      const fallback = await fetchQuoteFromFinnhub(symbol);
+      if (fallback) return fallback;
+    }
+    console.warn(`  ⚠️  ${symbol} 報價失敗：${yahooErr.message}`);
     return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// 歷史收盤價（供技術指標計算，Yahoo Finance chart API）
+// 回傳收盤價陣列（舊→新），失敗則回傳 null（指標跳過，不影響報告）
+// ─────────────────────────────────────────────
+async function fetchHistoricalCloses(symbol) {
+  try {
+    const r = await yahooFinance.chart(
+      symbol,
+      { range: '3mo', interval: '1d' },
+      { validateResult: false }
+    );
+    const closes = (r?.quotes || [])
+      .filter(q => q.close != null)
+      .map(q => q.close);
+    return closes.length >= 15 ? closes : null;
+  } catch {
+    return null;  // 歷史數據失敗不影響基本報表功能
   }
 }
 
@@ -302,10 +385,41 @@ async function fetchAllMarketData() {
   const totalSectorStocks = Object.values(sectorResults).reduce((a, b) => a + b.length, 0);
   console.log(`  ✅ 各產業共取得 ${totalSectorStocks} 支個股資料`);
 
+  // ── ⑮ 技術指標：計算 MAG7 + 指數 + 漲跌幅前後各 10 名 ──
+  const allQuotedRaw = [
+    ...INDICES.map((s, i) => ({ ...s, quote: indexData[i] })).filter(x => x.quote),
+    ...MAG7.map((s, i) =>    ({ ...s, quote: mag7Data[i]  })).filter(x => x.quote),
+    ...Object.values(sectorResults).flat(),
+  ];
+  const sortedByPct = [...allQuotedRaw]
+    .filter(s => s.quote?.changePct != null)
+    .sort((a, b) => b.quote.changePct - a.quote.changePct);
+
+  const indicatorTargets = new Set([
+    ...INDICES.map(s => s.symbol),
+    ...MAG7.map(s => s.symbol),
+    ...sortedByPct.slice(0, 10).map(s => s.symbol),   // 漲幅前 10
+    ...sortedByPct.slice(-10).map(s => s.symbol),      // 跌幅前 10
+  ]);
+
+  console.log(`📊 計算技術指標（${indicatorTargets.size} 支）...`);
+  const indicatorMap = {};
+  for (const symbol of indicatorTargets) {
+    const closes = await fetchHistoricalCloses(symbol);
+    if (closes) indicatorMap[symbol] = calculateIndicators(closes);
+    await sleep(150);  // 避免 Yahoo Finance 限速
+  }
+  console.log(`  ✅ 取得 ${Object.keys(indicatorMap).length} 支技術指標`);
+
+  // 附加 indicators 欄位到各股票物件
+  const attach = arr => arr.map(s => ({ ...s, indicators: indicatorMap[s.symbol] ?? null }));
+
   return {
-    indices:      INDICES.map((s, i) => ({ ...s, quote: indexData[i] })).filter(x => x.quote),
-    mag7:         MAG7.map((s, i)    => ({ ...s, quote: mag7Data[i]  })).filter(x => x.quote),
-    sectorStocks: sectorResults,
+    indices:      attach(INDICES.map((s, i) => ({ ...s, quote: indexData[i] })).filter(x => x.quote)),
+    mag7:         attach(MAG7.map((s, i)    => ({ ...s, quote: mag7Data[i]  })).filter(x => x.quote)),
+    sectorStocks: Object.fromEntries(
+      Object.entries(sectorResults).map(([k, v]) => [k, attach(v)])
+    ),
   };
 }
 
@@ -338,6 +452,65 @@ function formatVolume(vol) {
 function volumeRatio(vol, avg) {
   if (!vol || !avg || avg === 0) return null;
   return (vol / avg).toFixed(1);
+}
+
+// ─────────────────────────────────────────────
+// ⑮ 技術指標計算（RSI / 均線 / 布林通道）
+// 輸入：收盤價陣列（舊→新）
+// ─────────────────────────────────────────────
+
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  const changes = closes.slice(1).map((c, i) => c - closes[i]);
+  let avgGain = changes.slice(0, period).map(c => Math.max(c, 0)).reduce((a, b) => a + b, 0) / period;
+  let avgLoss = changes.slice(0, period).map(c => Math.max(-c, 0)).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < changes.length; i++) {
+    avgGain = (avgGain * (period - 1) + Math.max(changes[i],  0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-changes[i], 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+function calcBollinger(closes, period = 20) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const ma    = slice.reduce((a, b) => a + b, 0) / period;
+  const std   = Math.sqrt(slice.reduce((s, c) => s + (c - ma) ** 2, 0) / period);
+  return { upper: ma + 2 * std, lower: ma - 2 * std, ma };
+}
+
+// 整合計算所有指標，回傳 null 或指標物件
+function calculateIndicators(closes) {
+  if (!closes || closes.length < 15) return null;
+  const last    = closes[closes.length - 1];
+  const rsi14   = calcRSI(closes, 14);
+  const ma20    = calcSMA(closes, 20);
+  const ma50    = calcSMA(closes, 50);
+  const boll    = calcBollinger(closes, 20);
+  const ma20pct = ma20 ? ((last - ma20) / ma20 * 100) : null;
+  const ma50pct = ma50 ? ((last - ma50) / ma50 * 100) : null;
+  const bollPct = boll && boll.upper !== boll.lower
+    ? ((last - boll.lower) / (boll.upper - boll.lower) * 100) : null;
+  const rsiTag  = rsi14 == null ? '' : rsi14 >= 70 ? '【超買⚠️】' : rsi14 <= 30 ? '【超賣⚠️】' : '';
+  return { rsi14, ma20, ma50, ma20pct, ma50pct, bollPct, rsiTag };
+}
+
+// 格式化指標文字（給 GPT prompt 用）
+function fmtIndicatorLine(ind) {
+  if (!ind) return '';
+  const parts = [];
+  if (ind.rsi14   != null) parts.push(`RSI(14)=${ind.rsi14.toFixed(1)}${ind.rsiTag}`);
+  if (ind.ma20pct != null) parts.push(`MA20 ${ind.ma20pct >= 0 ? '+' : ''}${ind.ma20pct.toFixed(1)}%`);
+  if (ind.ma50pct != null) parts.push(`MA50 ${ind.ma50pct >= 0 ? '+' : ''}${ind.ma50pct.toFixed(1)}%`);
+  if (ind.bollPct != null) parts.push(`布林帶 ${ind.bollPct.toFixed(0)}%（0%=下軌 100%=上軌）`);
+  return parts.length ? `   📊 ${parts.join('  ')}\n` : '';
 }
 
 // ─────────────────────────────────────────────
@@ -376,6 +549,14 @@ function buildRankingSection(marketData) {
 
   let section = '<b>🏆 昨日全池漲跌幅排行</b>\n';
 
+  const fmtRankIndicators = (ind) => {
+    if (!ind) return '';
+    let tag = '';
+    if (ind.rsi14   != null) tag += `  RSI <b>${ind.rsi14.toFixed(0)}</b>${ind.rsi14 >= 70 ? '🔥' : ind.rsi14 <= 30 ? '🧊' : ''}`;
+    if (ind.ma20pct != null) tag += `  MA20 <b>${ind.ma20pct >= 0 ? '+' : ''}${ind.ma20pct.toFixed(1)}%</b>`;
+    return tag;
+  };
+
   section += '\n📈 <b>漲幅前五名</b>\n';
   top5.forEach((s, i) => {
     const medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][i];
@@ -383,6 +564,7 @@ function buildRankingSection(marketData) {
     section += `${medal} <b>${s.name}（${s.symbol}）</b> <b>${fmtPct(s.quote.changePct)}</b>`;
     section += `  $${fmt(s.quote.price)}`;
     if (vr && parseFloat(vr) >= 1.5) section += `  📦${vr}x量`;
+    section += fmtRankIndicators(s.indicators);
     section += `  <i>${s.sector}</i>\n`;
   });
 
@@ -393,6 +575,7 @@ function buildRankingSection(marketData) {
     section += `${num} <b>${s.name}（${s.symbol}）</b> <b>${fmtPct(s.quote.changePct)}</b>`;
     section += `  $${fmt(s.quote.price)}`;
     if (vr && parseFloat(vr) >= 1.5) section += `  📦${vr}x量`;
+    section += fmtRankIndicators(s.indicators);
     section += `  <i>${s.sector}</i>\n`;
   });
 
@@ -472,23 +655,25 @@ function buildMarketDataSection(marketData) {
   }
 
   section += '\n【七巨頭個股】\n';
-  for (const { name, symbol, quote: q } of mag7) {
+  for (const { name, symbol, quote: q, indicators: ind } of mag7) {
     const vr = volumeRatio(q.volume, q.avgVolume);
     section += `${trendEmoji(q.changePct)} ${name} (${symbol}): $${fmt(q.price)} ${fmtPct(q.changePct)}\n`;
     section += `   量: ${formatVolume(q.volume)}${vr ? ` (均量 ${vr}x)` : ''}  前收: $${fmt(q.prevClose)}\n`;
+    section += fmtIndicatorLine(ind);
   }
 
   section += '\n=== 各產業個股數據（供篩選焦點個股） ===\n';
   for (const [sector, stocks] of Object.entries(sectorStocks)) {
     if (!stocks.length) continue;
     section += `\n【${sector}】\n`;
-    for (const { name, symbol, quote: q } of stocks) {
+    for (const { name, symbol, quote: q, indicators: ind } of stocks) {
       const vr      = volumeRatio(q.volume, q.avgVolume);
       const dist52H = q.fiftyTwoWeekHigh
         ? `  距52週高: ${((q.price - q.fiftyTwoWeekHigh) / q.fiftyTwoWeekHigh * 100).toFixed(1)}%`
         : '';
       section += `${trendEmoji(q.changePct)} ${name} (${symbol}): $${fmt(q.price)} ${fmtPct(q.changePct)}`;
       section += `  量: ${formatVolume(q.volume)}${vr ? ` (均量 ${vr}x)` : ''}${dist52H}\n`;
+      section += fmtIndicatorLine(ind);
     }
   }
 
@@ -561,6 +746,14 @@ ${newsSection}
   ② 成交量 ≥ 均量 2 倍
   ③ 距 52 週高點 ±3% 以內（突破或接近高點）
   ④ 若有對應的新聞標題，優先列入
+  ⑤ RSI(14) ≥ 70【超買⚠️】或 ≤ 30【超賣⚠️】（有提供時才使用）
+  ⑥ 價格站上 MA50（由下往上突破）或跌破 MA50（由上往下）——重要結構訊號
+
+【技術指標說明（數據若存在即可引用）】
+- RSI(14)：動能指標。70 以上超買（短線有壓），30 以下超賣（反彈機率高）
+- MA20 ±%：距 20 日均線百分比，反映短線乖離
+- MA50 ±%：距 50 日均線百分比，反映中期趨勢強弱
+- 布林帶 %：0% 為下軌，100% 為上軌；>90% 或 <10% 代表極端位置
 
 【數量上限】
 - 整份報告焦點個股合計最多 5 支
@@ -571,14 +764,15 @@ ${newsSection}
 ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
 📌 <b>[產業標籤]｜[股票名稱]（[代碼]）</b>
 💰 <b>$[價格]</b>  [漲跌emoji] <b>[漲跌幅]</b>  📦 量能 <b>[均量倍數]x</b>
-🔍 <b>焦點：</b>[一句話，說明為何今日值得關注——必須有根據，不可憑空捏造]
-📋 <b>背景：</b>[產業趨勢或同業比較，2 句話，只能根據新聞標題或常識推論]
-👁 <b>後市關注：</b>[這個異動後，接下來應觀察什麼事件或指標？不要寫支撐阻力位數字]
+📊 RSI <b>[數值]</b>[若超買⚠️/超賣⚠️]  MA20 <b>[±%]</b>  MA50 <b>[±%]</b>（若有數據則輸出此行，若無數據則略去）
+🔍 <b>焦點：</b>[一句話，說明為何今日值得關注——可結合技術指標+量能+漲跌幅，必須有根據]
+📋 <b>背景：</b>[產業趨勢或同業比較，2 句話，可引用技術面結構（如站上MA50）或新聞標題]
+👁 <b>後市關注：</b>[技術面下一個觀察點（如 RSI 能否回落、是否守住 MA20）+ 基本面事件]
 
 【⚠️ 重要禁止事項】
-✗ 禁止寫「支撐 $xxx，阻力 $xxx」——這類技術位數字你沒有根據，不要瞎填
+✗ 禁止寫「支撐 $xxx，阻力 $xxx」——精確技術位數字你沒有根據，不要瞎填
 ✗ 禁止說「近期財報優於預期」「上週升評」等具體事件，除非新聞標題有明確依據
-✓ 「後市關注」應寫：「關注下週財報是否確認趨勢」、「留意費半指數同向性」等方向性判斷
+✓ 技術面可引用：RSI 值、MA20/MA50 相對位置、布林帶位置，這些是程式計算的真實數據
 
 ────────────────────────────────────────
 章節四｜📰 宏觀背景
@@ -787,7 +981,24 @@ async function generateAndSend() {
       fetchFinnhubNews(),
     ]);
     const sectorCount = Object.values(marketData.sectorStocks).reduce((a, b) => a + b.length, 0);
-    console.log(`  ✅ ${marketData.indices.length} 指數、${marketData.mag7.length} 巨頭、${sectorCount} 個股、${newsHeadlines.length} 則新聞`);
+    const finnhubCount = [
+      ...marketData.indices, ...marketData.mag7,
+      ...Object.values(marketData.sectorStocks).flat(),
+    ].filter(s => s.quote?._source === 'Finnhub').length;
+    console.log(`  ✅ ${marketData.indices.length} 指數、${marketData.mag7.length} 巨頭、${sectorCount} 個股、${newsHeadlines.length} 則新聞${finnhubCount ? `（其中 ${finnhubCount} 支使用 Finnhub 備援）` : ''}`);
+
+    // ── 若完全無數據則中斷，避免送出空白報告浪費 GPT 費用 ──
+    const totalFetched = marketData.indices.length + marketData.mag7.length + sectorCount;
+    if (totalFetched === 0) {
+      console.error('  ❌ 所有數據源均失敗，中斷報告生成');
+      await sendToTelegram(
+        `⚠️ <b>美股日報無法生成</b>\n` +
+        `原因：Yahoo Finance 與 Finnhub 股價均無法取得\n` +
+        `時間：${new Date().toLocaleString('zh-TW')}\n\n` +
+        `請至 Zeabur 查看日誌，確認 API 連線狀態。`
+      ).catch(() => {});
+      return;
+    }
 
     // Step 2：程式計算排行榜與財報日曆（不靠 GPT）
     const rankingSection  = buildRankingSection(marketData);
