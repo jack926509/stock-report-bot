@@ -21,7 +21,8 @@
 const OpenAI       = require('openai');
 const cron         = require('node-cron');
 const https        = require('https');
-const yahooFinance = require('yahoo-finance2').default;
+const YahooFinance = require('yahoo-finance2').default;
+const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -250,30 +251,86 @@ function fetchStockNews(symbol) {
 }
 
 // ─────────────────────────────────────────────
-// Yahoo Finance 報價
+// Finnhub 股票報價備援（Yahoo Finance 失敗時使用）
+// GET /api/v1/quote?symbol=AAPL&token=KEY
+// c=現價 d=漲跌 dp=漲跌% h=最高 l=最低 o=開盤 pc=前收
+// ─────────────────────────────────────────────
+function fetchQuoteFromFinnhub(symbol) {
+  return new Promise((resolve) => {
+    if (!FINNHUB_KEY) { resolve(null); return; }
+    const path = `/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
+    https.get({ hostname: 'finnhub.io', path }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const q = JSON.parse(data);
+          // c === 0 代表找不到該 symbol 或盤後無資料
+          if (!q || q.c == null || q.c === 0) { resolve(null); return; }
+          resolve({
+            symbol,
+            price:            q.c,
+            change:           q.d   ?? null,
+            changePct:        q.dp  ?? null,
+            prevClose:        q.pc  ?? null,
+            open:             q.o   ?? null,
+            high:             q.h   ?? null,
+            low:              q.l   ?? null,
+            volume:           null,        // Finnhub 免費版無成交量
+            avgVolume:        null,
+            marketCap:        null,
+            fiftyTwoWeekHigh: null,
+            fiftyTwoWeekLow:  null,
+            earningsDate:     null,
+            shortName:        symbol,
+            _source:          'Finnhub',  // 標記備援來源
+          });
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
+
+// ─────────────────────────────────────────────
+// Yahoo Finance 報價（8 秒逾時 + Finnhub 備援）
 // ─────────────────────────────────────────────
 async function fetchQuote(symbol) {
+  // ── 嘗試 Yahoo Finance（8 秒逾時）──
   try {
-    const q = await yahooFinance.quote(symbol, {}, { validateResult: false });
-    return {
-      symbol,
-      price:            q.regularMarketPrice,
-      change:           q.regularMarketChange,
-      changePct:        q.regularMarketChangePercent,
-      prevClose:        q.regularMarketPreviousClose,
-      open:             q.regularMarketOpen,
-      high:             q.regularMarketDayHigh,
-      low:              q.regularMarketDayLow,
-      volume:           q.regularMarketVolume,
-      avgVolume:        q.averageDailyVolume3Month,
-      marketCap:        q.marketCap,
-      fiftyTwoWeekHigh: q.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow:  q.fiftyTwoWeekLow,
-      earningsDate:     q.earningsTimestamp ?? q.earningsTimestampStart ?? null,
-      shortName:        q.shortName || symbol,
-    };
-  } catch (err) {
-    console.warn(`  ⚠️  無法取得 ${symbol} 報價：${err.message}`);
+    const quotePromise   = yahooFinance.quote(symbol, {}, { validateResult: false });
+    const timeoutPromise = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error('Yahoo 請求逾時 8s')), 8000)
+    );
+    const q = await Promise.race([quotePromise, timeoutPromise]);
+
+    if (q?.regularMarketPrice != null) {
+      return {
+        symbol,
+        price:            q.regularMarketPrice,
+        change:           q.regularMarketChange,
+        changePct:        q.regularMarketChangePercent,
+        prevClose:        q.regularMarketPreviousClose,
+        open:             q.regularMarketOpen,
+        high:             q.regularMarketDayHigh,
+        low:              q.regularMarketDayLow,
+        volume:           q.regularMarketVolume,
+        avgVolume:        q.averageDailyVolume3Month,
+        marketCap:        q.marketCap,
+        fiftyTwoWeekHigh: q.fiftyTwoWeekHigh,
+        fiftyTwoWeekLow:  q.fiftyTwoWeekLow,
+        earningsDate:     q.earningsTimestamp ?? q.earningsTimestampStart ?? null,
+        shortName:        q.shortName || symbol,
+      };
+    }
+    throw new Error(`Yahoo 回傳空值 (price=${q?.regularMarketPrice})`);
+
+  } catch (yahooErr) {
+    // ── 備援：改用 Finnhub 免費報價 ──
+    if (FINNHUB_KEY) {
+      const fallback = await fetchQuoteFromFinnhub(symbol);
+      if (fallback) return fallback;
+    }
+    console.warn(`  ⚠️  ${symbol} 報價失敗：${yahooErr.message}`);
     return null;
   }
 }
@@ -787,7 +844,24 @@ async function generateAndSend() {
       fetchFinnhubNews(),
     ]);
     const sectorCount = Object.values(marketData.sectorStocks).reduce((a, b) => a + b.length, 0);
-    console.log(`  ✅ ${marketData.indices.length} 指數、${marketData.mag7.length} 巨頭、${sectorCount} 個股、${newsHeadlines.length} 則新聞`);
+    const finnhubCount = [
+      ...marketData.indices, ...marketData.mag7,
+      ...Object.values(marketData.sectorStocks).flat(),
+    ].filter(s => s.quote?._source === 'Finnhub').length;
+    console.log(`  ✅ ${marketData.indices.length} 指數、${marketData.mag7.length} 巨頭、${sectorCount} 個股、${newsHeadlines.length} 則新聞${finnhubCount ? `（其中 ${finnhubCount} 支使用 Finnhub 備援）` : ''}`);
+
+    // ── 若完全無數據則中斷，避免送出空白報告浪費 GPT 費用 ──
+    const totalFetched = marketData.indices.length + marketData.mag7.length + sectorCount;
+    if (totalFetched === 0) {
+      console.error('  ❌ 所有數據源均失敗，中斷報告生成');
+      await sendToTelegram(
+        `⚠️ <b>美股日報無法生成</b>\n` +
+        `原因：Yahoo Finance 與 Finnhub 股價均無法取得\n` +
+        `時間：${new Date().toLocaleString('zh-TW')}\n\n` +
+        `請至 Zeabur 查看日誌，確認 API 連線狀態。`
+      ).catch(() => {});
+      return;
+    }
 
     // Step 2：程式計算排行榜與財報日曆（不靠 GPT）
     const rankingSection  = buildRankingSection(marketData);
