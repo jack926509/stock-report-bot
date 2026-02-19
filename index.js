@@ -1170,3 +1170,14 @@ console.log(`║  技術指標：RSI(14) / MA20 / MA50 / 布林通道          �
 console.log(`║  財經新聞分析：MAG7 + 當日大幅異動個股新聞           ║`);
 console.log(`║  新聞上限：宏觀 ${String(NEWS_MARKET_LIMIT).padEnd(2)} 條 ／ 每支個股 ${NEWS_STOCK_LIMIT} 條               ║`);
 console.log('╚══════════════════════════════════════════════════════╝');
+
+// ─────────────────────────────────────────────
+// RUN_NOW 即時觸發模式（測試用）
+// 在 Zeabur 設定環境變數 RUN_NOW=true 並重啟服務即可立即發送一次報告
+// 測試完畢後請移除該環境變數，避免每次重啟都觸發
+// ─────────────────────────────────────────────
+if (process.env.RUN_NOW === 'true') {
+  console.log('⚡ RUN_NOW 模式：立即執行一次報告生成...');
+  console.log('⚠️  測試完成後請在 Zeabur 移除 RUN_NOW 環境變數');
+  generateAndSend();
+}
