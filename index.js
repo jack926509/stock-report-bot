@@ -66,6 +66,12 @@ const SCHEDULE = '30 7 * * 1-5';   // 台北時間週一至週五 07:30
 const TIMEZONE = 'Asia/Taipei';
 
 // ─────────────────────────────────────────────
+// 新聞抓取上限設定
+// ─────────────────────────────────────────────
+const NEWS_MARKET_LIMIT = 20;   // 宏觀市場新聞最多幾條（fetchFinnhubNews）
+const NEWS_STOCK_LIMIT  = 3;    // 每支個股新聞最多幾條（fetchStockNews）
+
+// ─────────────────────────────────────────────
 // 指數清單
 // ─────────────────────────────────────────────
 const INDICES = [
@@ -219,7 +225,7 @@ function fetchFinnhubNews() {
           // 只取標題，過濾掉雜訊，最多 20 條
           const headlines = articles
             .filter(a => a.headline && a.headline.length > 10)
-            .slice(0, 20)
+            .slice(0, NEWS_MARKET_LIMIT)
             .map(a => `• ${a.headline}`);
 
           console.log(`  ✅ 取得 ${headlines.length} 條市場新聞標題`);
@@ -253,7 +259,7 @@ function fetchStockNews(symbol) {
         try {
           const articles = JSON.parse(data);
           if (!Array.isArray(articles)) { resolve([]); return; }
-          resolve(articles.slice(0, 3).map(a => a.headline).filter(Boolean));
+          resolve(articles.slice(0, NEWS_STOCK_LIMIT).map(a => a.headline).filter(Boolean));
         } catch { resolve([]); }
       });
     }).on('error', () => resolve([]));
@@ -1162,4 +1168,5 @@ console.log(`║  新聞  ：Finnhub ${FINNHUB_KEY ? '✅ 已啟用' : '❌ 未�
 console.log(`║  個股池：${Object.keys(SECTOR_STOCKS).length} 大產業 / ${totalStocks} 支個股                        ║`);
 console.log(`║  技術指標：RSI(14) / MA20 / MA50 / 布林通道          ║`);
 console.log(`║  財經新聞分析：MAG7 + 當日大幅異動個股新聞           ║`);
+console.log(`║  新聞上限：宏觀 ${String(NEWS_MARKET_LIMIT).padEnd(2)} 條 ／ 每支個股 ${NEWS_STOCK_LIMIT} 條               ║`);
 console.log('╚══════════════════════════════════════════════════════╝');
