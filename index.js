@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報機器人 v4.2
+// 美股日報機器人 v4.3
 // ─── 沿用 v3.0 功能 ─────────────────────────────────────
 //   ① Yahoo Finance 即時股價
 //   ② 非交易日自動跳過
@@ -26,13 +26,18 @@
 //   ⑱  fetchKeyStockNews()：批次抓取 MAG7 + 當日漲跌前三名個股新聞
 //   ⑲  GPT 報告新增「🗞️ 財經新聞分析」章節（第八章）
 //       每則新聞結合當日股價表現，說明市場如何消化該消息
+// ─── v4.3 Notion 存檔 ───────────────────────────────────
+//   ⑳  每日報告自動建立 Notion 子頁面（NOTION_API_KEY 啟用）
+//       htmlToNotionBlocks() 轉換報告格式 → paragraph blocks
+//       超過 100 blocks 自動分批 append
 // ═══════════════════════════════════════════════════════════
 
-const OpenAI       = require('openai');
-const cron         = require('node-cron');
-const https        = require('https');
-const YahooFinance = require('yahoo-finance2').default;
-const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+const OpenAI        = require('openai');
+const cron          = require('node-cron');
+const https         = require('https');
+const { Client: NotionClient } = require('@notionhq/client');
+const YahooFinance  = require('yahoo-finance2').default;
+const yahooFinance  = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -50,14 +55,20 @@ function validateEnv() {
     console.warn('⚠️  FINNHUB_API_KEY 未設定，新聞功能將停用（不影響其他功能）');
     console.warn('   → 免費申請：https://finnhub.io/register');
   }
+  if (!process.env.NOTION_API_KEY) {
+    console.warn('⚠️  NOTION_API_KEY 未設定，報告不會存入 Notion（不影響其他功能）');
+    console.warn('   → 請至 https://www.notion.so/profile/integrations 建立 Integration 取得 Token');
+  }
 }
 
 validateEnv();
 
-const OPENAI_KEY    = process.env.OPENAI_API_KEY;
-const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID       = process.env.TELEGRAM_CHAT_ID;
-const FINNHUB_KEY   = process.env.FINNHUB_API_KEY || null;
+const OPENAI_KEY     = process.env.OPENAI_API_KEY;
+const BOT_TOKEN      = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID        = process.env.TELEGRAM_CHAT_ID;
+const FINNHUB_KEY    = process.env.FINNHUB_API_KEY    || null;
+const NOTION_KEY     = process.env.NOTION_API_KEY     || null;
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID     || '30d21c6ed34080cc9683fbf5b75ef1b0';
 
 // ─────────────────────────────────────────────
 // 排程設定
@@ -1042,6 +1053,83 @@ function isTradingDay() {
 }
 
 // ─────────────────────────────────────────────
+// Notion 整合
+// ─────────────────────────────────────────────
+
+/** 將 HTML 報告轉換為 Notion paragraph blocks（純文字，保留 emoji 結構） */
+function htmlToNotionBlocks(html) {
+  const plain = html
+    .replace(/<b>(.*?)<\/b>/gs, '$1')
+    .replace(/<i>(.*?)<\/i>/gs, '$1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  const blocks = [];
+  for (const line of plain.split('\n')) {
+    // Notion 每個 block 內容上限 2000 字元
+    let remaining = line.trim();
+    if (!remaining) {
+      blocks.push({ object: 'block', type: 'paragraph', paragraph: { rich_text: [] } });
+      continue;
+    }
+    while (remaining.length > 0) {
+      const chunk = remaining.slice(0, 2000);
+      remaining = remaining.slice(2000);
+      blocks.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: { rich_text: [{ type: 'text', text: { content: chunk } }] },
+      });
+    }
+  }
+  return blocks;
+}
+
+/**
+ * 在指定的 Notion 父頁面下新建一個子頁面，並將報告內容寫入。
+ * 需要環境變數 NOTION_API_KEY。
+ * NOTION_PAGE_ID 預設為專案指定頁面，也可透過環境變數覆蓋。
+ */
+async function sendToNotion(title, htmlContent) {
+  if (!NOTION_KEY) {
+    console.log('  ⚠️  NOTION_API_KEY 未設定，跳過 Notion 儲存');
+    return;
+  }
+
+  const notion = new NotionClient({ auth: NOTION_KEY });
+  const allBlocks = htmlToNotionBlocks(htmlContent);
+
+  try {
+    // Notion API: pages.create 最多接受 100 個初始 blocks
+    const page = await notion.pages.create({
+      parent: { page_id: NOTION_PAGE_ID },
+      properties: {
+        title: { title: [{ text: { content: title } }] },
+      },
+      children: allBlocks.slice(0, 100),
+    });
+
+    // 若超過 100 blocks，分批 append
+    const rest = allBlocks.slice(100);
+    for (let i = 0; i < rest.length; i += 100) {
+      await notion.blocks.children.append({
+        block_id: page.id,
+        children: rest.slice(i, i + 100),
+      });
+    }
+
+    console.log(`  ✅ Notion 頁面已建立：${page.url}`);
+    return page;
+  } catch (err) {
+    console.error(`  ❌ Notion 發送失敗：${err.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────
 // 主執行函數
 // ─────────────────────────────────────────────
 async function generateAndSend() {
@@ -1134,8 +1222,14 @@ async function generateAndSend() {
       if (i < chunks.length - 1) await sleep(1500);
     }
 
+    console.log(`  🎉 Telegram：${successCount}/${chunks.length} 段發送成功`);
+
+    // Step 6：存入 Notion
+    const notionTitle = `美股日報｜${dateStr} ${weekday}`;
+    await sendToNotion(notionTitle, fullReport);
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`  🎉 完成！${successCount}/${chunks.length} 段發送成功，耗時 ${elapsed}s`);
+    console.log(`  ✅ 全部完成，耗時 ${elapsed}s`);
 
   } catch (err) {
     console.error(`  ❌ 執行失敗：${err.message}`);
@@ -1159,12 +1253,13 @@ cron.schedule(SCHEDULE, generateAndSend, { timezone: TIMEZONE });
 
 const totalStocks = Object.values(SECTOR_STOCKS).flat().length;
 console.log('╔══════════════════════════════════════════════════════╗');
-console.log('║  美股日報機器人 v4.2  已啟動                          ║');
+console.log('║  美股日報機器人 v4.3  已啟動                          ║');
 console.log('╠══════════════════════════════════════════════════════╣');
 console.log(`║  排程  ：${SCHEDULE} (${TIMEZONE})         ║`);
 console.log(`║  模型  ：GPT-4o                                       ║`);
 console.log(`║  股價  ：Yahoo Finance（即時）                        ║`);
 console.log(`║  新聞  ：Finnhub ${FINNHUB_KEY ? '✅ 已啟用' : '❌ 未設定（功能停用）'}                      ║`);
+console.log(`║  Notion ：${NOTION_KEY ? '✅ 已啟用（報告自動存檔）' : '❌ 未設定（功能停用）'}               ║`);
 console.log(`║  個股池：${Object.keys(SECTOR_STOCKS).length} 大產業 / ${totalStocks} 支個股                        ║`);
 console.log(`║  技術指標：RSI(14) / MA20 / MA50 / 布林通道          ║`);
 console.log(`║  財經新聞分析：MAG7 + 當日大幅異動個股新聞           ║`);
