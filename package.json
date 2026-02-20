@@ -7,8 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "node-cron":      "^3.0.3",
-    "openai":         "^4.77.0",
+    "@notionhq/client": "^5.9.0",
+    "node-cron": "^3.0.3",
+    "openai": "^4.77.0",
     "yahoo-finance2": "^3.3.0"
   }
 }
