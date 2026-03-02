@@ -66,6 +66,7 @@ const TIMEZONE    = 'Asia/Taipei';
 
 const STOCK_SCHEDULE = '30 7 * * 1-5';
 const NEWS_SCHEDULE  = '35 7 * * *';
+const FLASH_SCHEDULE = '40 7 * * 1-5'; // 週一至週五 07:40 美股新聞快訊
 const NEWS_MARKET_LIMIT = 20;
 const NEWS_STOCK_LIMIT  = 3;
 
@@ -858,6 +859,234 @@ async function runNewsReport() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// PART 3：美股新聞快訊（07:40，週一至週五）
+//
+// 每日整理前一交易日的重大美股新聞：
+//  ① Finnhub 市場新聞（一般市場頭條）
+//  ② Finnhub 個股新聞（MAG7 + 池內個股，僅高評分才納入）
+//  ③ Yahoo Finance 個股新聞（補充 Finnhub 沒有的）
+//  ④ GPT-4o-mini 評分過濾（≥4 分才推）+ 分類整理
+//  ⑤ 依「大盤事件 / 個股快訊」分組推播
+// ═══════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// Yahoo Finance 個股新聞抓取
+// 使用 yahooFinance.search() 的 news 結果
+// ─────────────────────────────────────────────
+async function fetchYahooStockNews(symbol, maxItems = 5) {
+  try {
+    const result = await yahooFinance.search(symbol, { newsCount: maxItems }, { validateResult: false });
+    const now    = new Date();
+    const cutoff = new Date(now - 48 * 3600 * 1000); // 48小時內（美股昨日盤面）
+    return (result?.news || [])
+      .filter(n => n.title && new Date(n.providerPublishTime * 1000) > cutoff)
+      .slice(0, maxItems)
+      .map(n => ({
+        title:    n.title,
+        link:     n.link || '',
+        source:   n.publisher || 'Yahoo Finance',
+        symbol,
+        pubTime:  n.providerPublishTime * 1000,
+      }));
+  } catch { return []; }
+}
+
+// ─────────────────────────────────────────────
+// 收集快訊新聞原料
+// 來源：Finnhub 市場新聞 + Finnhub/Yahoo 個股新聞
+// 對象：MAG7 + 所有池內個股（80支）
+// ─────────────────────────────────────────────
+async function collectFlashNews() {
+  log('FLASH', '開始收集快訊新聞原料...');
+
+  // 1. Finnhub 市場大盤新聞（昨日）
+  const marketNews = await fetchFinnhubNews();
+  log('FLASH', `Finnhub 市場新聞：${marketNews.length} 條`);
+
+  // 2. 收集所有目標個股清單（MAG7 + 8 大產業池，去重）
+  const allSymbols = new Map();
+  for (const s of MAG7) allSymbols.set(s.symbol, s.name);
+  for (const stocks of Object.values(SECTOR_STOCKS)) {
+    for (const s of stocks) allSymbols.set(s.symbol, s.name);
+  }
+
+  // 3. 個股新聞：Finnhub 優先，失敗或空則補 Yahoo Finance
+  const stockArticles = [];
+  let count = 0;
+  for (const [symbol, name] of allSymbols) {
+    // Finnhub 個股新聞
+    let headlines = [];
+    if (FINNHUB_KEY) {
+      headlines = await fetchStockNews(symbol); // 已有此函式，回傳 string[]
+      await sleep(250);
+    }
+
+    if (headlines.length > 0) {
+      for (const title of headlines) {
+        stockArticles.push({ title, link: '', source: 'Finnhub', symbol, name, pubTime: Date.now() });
+      }
+    } else {
+      // 備援：Yahoo Finance 個股新聞
+      const yahooNews = await fetchYahooStockNews(symbol, 3);
+      for (const n of yahooNews) {
+        stockArticles.push({ ...n, name });
+      }
+      await sleep(150);
+    }
+    count++;
+    if (count % 20 === 0) log('FLASH', `已掃描 ${count}/${allSymbols.size} 支個股...`);
+  }
+
+  log('FLASH', `個股新聞原料：${stockArticles.length} 條（${allSymbols.size} 支個股）`);
+  return { marketNews, stockArticles };
+}
+
+// ─────────────────────────────────────────────
+// GPT-4o-mini 分析快訊：評分 + 分類
+// 只回傳評分 ≥ 4 的新聞
+// ─────────────────────────────────────────────
+async function analyzeFlashNews(marketNews, stockArticles) {
+  // 市場新聞處理（直接用 GPT 篩選重要條目）
+  const marketPrompt = marketNews.length > 0
+    ? `以下是昨日美股市場新聞標題，請篩選出最重要的 3~5 條並回傳 JSON。
+評分：5=Fed/CPI/重大地緣/系統性風險，4=重要總經事件，3以下忽略。
+回傳純 JSON（不要其他文字）：
+{"items":[{"title":"原始標題","summary_zh":"繁中摘要20字內","importance":5,"category":"Fed政策|通膨|地緣|財報|市場結構"}]}
+
+新聞：
+${marketNews.slice(0, 30).join('\n')}`
+    : null;
+
+  // 個股新聞處理（去重 + 批次評分）
+  const dedupedStock = [];
+  const seenTitles   = new Set();
+  for (const a of stockArticles) {
+    const key = a.title.slice(0, 50); // 前50字去重
+    if (!seenTitles.has(key)) {
+      seenTitles.add(key);
+      dedupedStock.push(a);
+    }
+  }
+
+  // 只取前 60 條給 GPT（避免超過 token 上限）
+  const stockSample = dedupedStock.slice(0, 60);
+  const stockText   = stockSample.map((a, i) =>
+    `[${i + 1}] ${a.name}(${a.symbol}): ${a.title}`
+  ).join('\n');
+
+  const stockPrompt = `以下是昨日美股個股新聞，請評分並篩選重要條目回傳 JSON。
+評分：5=重大財報/產品發布/CEO異動/重大訴訟，4=業績預警/升降評/併購，3以下忽略。
+只回傳評分 ≥ 4 的條目，最多 10 條。
+回傳純 JSON（不要其他文字）：
+{"items":[{"id":1,"symbol":"NVDA","name":"Nvidia","summary_zh":"繁中摘要25字內","importance":5,"category":"財報|升評|降評|產品|法規|併購|人事|其他"}]}
+
+個股新聞：
+${stockText}`;
+
+  // 並行呼叫兩個 GPT 分析
+  const [marketResult, stockResult] = await Promise.all([
+    marketPrompt ? callOpenAI(marketPrompt, 'gpt-4o-mini', 1000).then(r => {
+      try { return JSON.parse(r.replace(/```json|```/g, '').trim()); } catch { return { items: [] }; }
+    }).catch(() => ({ items: [] })) : Promise.resolve({ items: [] }),
+
+    callOpenAI(stockPrompt, 'gpt-4o-mini', 1500).then(r => {
+      try { return JSON.parse(r.replace(/```json|```/g, '').trim()); } catch { return { items: [] }; }
+    }).catch(() => ({ items: [] })),
+  ]);
+
+  log('FLASH', `篩選結果：大盤 ${marketResult.items?.length || 0} 條 / 個股 ${stockResult.items?.length || 0} 條`);
+  return {
+    market: marketResult.items || [],
+    stocks: (stockResult.items || []).filter(x => x.importance >= 4),
+  };
+}
+
+// ─────────────────────────────────────────────
+// 組合快訊 Telegram 訊息
+// ─────────────────────────────────────────────
+function buildFlashMessage(analyzed) {
+  const now     = new Date();
+  const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
+  const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
+
+  let msg = `<b>⚡ 美股新聞快訊｜${dateStr} ${weekday}</b>\n`;
+  msg += `<i>昨日重大事件整理 · Finnhub / Yahoo Finance</i>\n`;
+  msg += `${'─'.repeat(28)}\n`;
+
+  // ── 大盤事件 ──
+  if (analyzed.market.length > 0) {
+    msg += `\n<b>🌐 大盤重大事件</b>\n`;
+    for (const item of analyzed.market) {
+      const badge = item.importance === 5 ? '🔴' : '🟡';
+      msg += `${badge} <b>${item.summary_zh}</b>`;
+      if (item.category) msg += `  <i>[${item.category}]</i>`;
+      msg += '\n';
+    }
+  } else {
+    msg += `\n<b>🌐 大盤重大事件</b>\n⚪️ 昨日無重大總經或地緣事件\n`;
+  }
+
+  // ── 個股快訊 ──
+  if (analyzed.stocks.length > 0) {
+    msg += `\n<b>📌 個股快訊</b>\n`;
+
+    // 按重要性排序，再按 category 分組
+    const sorted = [...analyzed.stocks].sort((a, b) => b.importance - a.importance);
+    for (const item of sorted) {
+      const badge = item.importance === 5 ? '🔴' : '🟡';
+      msg += `${badge} <b>${item.name}（${item.symbol}）</b>`;
+      if (item.category) msg += ` <i>[${item.category}]</i>`;
+      msg += `\n   ${item.summary_zh}\n`;
+    }
+  } else {
+    msg += `\n<b>📌 個股快訊</b>\n⚪️ 昨日池內個股無重大事件\n`;
+  }
+
+  msg += `\n${'─'.repeat(28)}\n`;
+  msg += `<i>⚠️ AI 自動整理，僅供參考，不構成投資建議</i>`;
+  return msg;
+}
+
+// ─────────────────────────────────────────────
+// 執行快訊報告
+// ─────────────────────────────────────────────
+async function runFlashReport() {
+  if (!isTradingDay()) return;
+  const startTime = Date.now();
+  log('FLASH', '🚀 開始執行美股新聞快訊');
+
+  try {
+    const { marketNews, stockArticles } = await collectFlashNews();
+
+    if (marketNews.length === 0 && stockArticles.length === 0) {
+      log('FLASH', '無任何新聞原料，跳過推播');
+      return;
+    }
+
+    log('FLASH', '分析新聞重要性...');
+    const analyzed = await analyzeFlashNews(marketNews, stockArticles);
+
+    // 若大盤和個股都沒有高分新聞，靜默跳過（不發空訊息）
+    if (analyzed.market.length === 0 && analyzed.stocks.length === 0) {
+      log('FLASH', '無高重要性新聞（≥4分），今日跳過推播');
+      return;
+    }
+
+    const message = buildFlashMessage(analyzed);
+    const chunks  = splitMessage(message, 3800);
+    for (let i = 0; i < chunks.length; i++) {
+      await sendTelegram(chunks[i]);
+      if (i < chunks.length - 1) await sleep(1000);
+    }
+
+    log('FLASH', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+  } catch (err) {
+    log('FLASH', `❌ 失敗：${err.message}`);
+    await sendTelegram(`⚠️ 美股新聞快訊失敗\n錯誤：${err.message}`).catch(() => {});
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // 共用工具
 // ═══════════════════════════════════════════════════════════
 
@@ -962,7 +1191,7 @@ async function startPolling() {
         if (chatId !== CHAT_ID) continue;
         if (text === '/ping') {
           await sendRawTelegram(
-            `🟢 Bot 運作正常\n版本：v5.0\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}\n記憶體：${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
+            `🟢 Bot 運作正常\n版本：v5.1\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}\n記憶體：${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
           );
         } else if (text === '/news') {
           await sendRawTelegram('⏳ 手動觸發 AI 新聞摘要...');
@@ -970,6 +1199,9 @@ async function startPolling() {
         } else if (text === '/stock') {
           await sendRawTelegram('⏳ 手動觸發美股日報...');
           runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+        } else if (text === '/flash') {
+          await sendRawTelegram('⏳ 手動觸發美股新聞快訊...');
+          runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
         }
       }
     } catch (e) { log('POLL', `polling 錯誤: ${e.message}`); }
@@ -1035,18 +1267,25 @@ async function main() {
     runNewsReport().catch(e => log('NEWS', `排程失敗: ${e.message}`));
   }, { timezone: TIMEZONE });
 
+  cron.schedule(FLASH_SCHEDULE, () => {
+    log('CRON', '⏰ 觸發美股新聞快訊排程');
+    runFlashReport().catch(e => log('FLASH', `排程失敗: ${e.message}`));
+  }, { timezone: TIMEZONE });
+
   log('MAIN', `📊 美股日報：${STOCK_SCHEDULE} (Asia/Taipei)`);
   log('MAIN', `📰 AI 新聞：${NEWS_SCHEDULE}  (Asia/Taipei)`);
+  log('MAIN', `⚡ 美股快訊：${FLASH_SCHEDULE} (Asia/Taipei)`);
 
   startWatchdog();
   startHealthServer();
   startPolling();
 
   await sendTelegram(
-    `🟢 <b>美股日報 + AI 科技新聞 Bot v5.0 啟動</b>\n\n` +
+    `🟢 <b>美股日報 + AI 科技新聞 Bot v5.1 啟動</b>\n\n` +
     `📊 美股日報：週一至週五 07:30\n` +
+    `⚡ 美股新聞快訊：週一至週五 07:40\n` +
     `📰 AI 科技新聞：每天 07:35\n\n` +
-    `指令：\n/ping — 確認 Bot 存活\n/stock — 立即觸發美股日報\n/news — 立即觸發 AI 新聞`
+    `指令：\n/ping — 確認 Bot 存活\n/stock — 立即觸發美股日報\n/flash — 立即觸發美股新聞快訊\n/news — 立即觸發 AI 新聞`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');
@@ -1056,8 +1295,9 @@ if (process.env.RUN_NOW === 'true') {
   log('MAIN', '⚡ RUN_NOW 測試模式');
   main().then(() => {
     const target = process.env.RUN_NOW_TARGET || 'stock';
-    if (target === 'news') runNewsReport();
-    else                   runStockReport();
+    if (target === 'news')  runNewsReport();
+    else if (target === 'flash') runFlashReport();
+    else                    runStockReport();
   });
 } else {
   main().catch(e => { console.error('❌ 主程式崩潰:', e); process.exit(1); });
