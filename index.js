@@ -514,28 +514,31 @@ function buildRankingSection(marketData) {
 
   const fmtRankInd = (ind) => {
     if (!ind) return '';
-    let tag = '';
-    if (ind.rsi14   != null) tag += `  RSI <b>${ind.rsi14.toFixed(0)}</b>${ind.rsi14 >= 70 ? '🔥' : ind.rsi14 <= 30 ? '🧊' : ''}`;
-    if (ind.ma20pct != null) tag += `  MA20 <b>${ind.ma20pct >= 0 ? '+' : ''}${ind.ma20pct.toFixed(1)}%</b>`;
-    return tag;
+    const parts = [];
+    if (ind.rsi14   != null) parts.push(`RSI <b>${ind.rsi14.toFixed(0)}</b>${ind.rsi14 >= 70 ? '🔥' : ind.rsi14 <= 30 ? '🧊' : ''}`);
+    if (ind.ma20pct != null) parts.push(`MA20 <b>${ind.ma20pct >= 0 ? '+' : ''}${ind.ma20pct.toFixed(1)}%</b>`);
+    return parts.length ? `\n     ${parts.join(' · ')}` : '';
   };
 
-  let section = '<b>🏆 昨日全池漲跌幅排行</b>\n\n📈 <b>漲幅前五名</b>\n';
-  top5.forEach((s, i) => {
-    const medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][i];
-    const vr    = volumeRatio(s.quote.volume, s.quote.avgVolume);
-    section += `${medal} <b>${s.name}（${s.symbol}）</b> <b>${fmtPct(s.quote.changePct)}</b>  $${fmt(s.quote.price)}`;
-    if (vr && parseFloat(vr) >= 1.5) section += `  📦${vr}x量`;
-    section += fmtRankInd(s.indicators) + `  <i>${s.sector}</i>\n`;
-  });
-  section += '\n📉 <b>跌幅前五名</b>\n';
-  bot5.forEach((s, i) => {
-    const num = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'][i];
-    const vr  = volumeRatio(s.quote.volume, s.quote.avgVolume);
-    section += `${num} <b>${s.name}（${s.symbol}）</b> <b>${fmtPct(s.quote.changePct)}</b>  $${fmt(s.quote.price)}`;
-    if (vr && parseFloat(vr) >= 1.5) section += `  📦${vr}x量`;
-    section += fmtRankInd(s.indicators) + `  <i>${s.sector}</i>\n`;
-  });
+  const fmtRankRow = (s, badge) => {
+    const vr = volumeRatio(s.quote.volume, s.quote.avgVolume);
+    let row = `${badge} <b>${s.name}</b>（<code>${s.symbol}</code>）`;
+    row += `  <b>${fmtPct(s.quote.changePct)}</b>  $${fmt(s.quote.price)}`;
+    if (vr && parseFloat(vr) >= 1.5) row += `  📦 ${vr}x`;
+    row += `  <i>${s.sector}</i>`;
+    row += fmtRankInd(s.indicators);
+    return row + '\n';
+  };
+
+  let section = '<b>🏆 漲跌幅排行</b>\n\n';
+  section += '📈 <b>漲幅 TOP 5</b>\n';
+  const upMedals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+  top5.forEach((s, i) => { section += fmtRankRow(s, upMedals[i]); });
+
+  section += '\n📉 <b>跌幅 TOP 5</b>\n';
+  const downNums = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+  bot5.forEach((s, i) => { section += fmtRankRow(s, downNums[i]); });
+
   return section;
 }
 
@@ -559,8 +562,10 @@ function buildEarningsSection(marketData) {
   }
   if (upcoming.length === 0) return null;
   upcoming.sort((a, b) => a.ts - b.ts);
-  let section = '<b>📅 本週財報預告</b>（池內個股）\n';
-  for (const s of upcoming) section += `▸ <b>${s.name}（${s.symbol}）</b> — ${s.dateStr} 出財報\n`;
+  let section = '<b>📅 本週財報預告</b>\n';
+  for (const s of upcoming) {
+    section += `  📌 <b>${s.name}</b>（<code>${s.symbol}</code>）— ${s.dateStr}\n`;
+  }
   return section;
 }
 
@@ -628,45 +633,58 @@ ${dataSection}
 ${newsSection}
 ${stockNewsSection}
 
-撰寫要求：
+=== 排版規範 ===
 - 語言：繁體中文
-- 格式：只用 Telegram HTML 標籤（<b> <i> <code>），禁止 Markdown
+- 格式：只用 Telegram HTML（<b> <i> <code>），禁止 Markdown 語法
 - 直接輸出報告本文，不加說明前言
+- 每個章節標題獨佔一行，標題後空一行再寫內容
+- 章節之間空一行，保持閱讀節奏
+- 數字用 <code> 標籤包裹使其突出（如 <code>+1.23%</code>、<code>$182.50</code>）
+- 股票代碼用 <code> 標籤（如 <code>NVDA</code>）
+- 每段文字控制在 2~3 句內，避免長段落壓迫感
+- 善用 emoji 作為視覺錨點，但不過度堆疊
 
-章節一｜<b>📊 三大指數總覽</b>
-三大指數 + VIX 逐項列出，附一段整體氛圍解讀
+=== 章節結構 ===
 
-章節二｜<b>🔮 七巨頭動態</b>
-最強最弱各一名重點點評，其餘五支簡列，附整體意涵
+<b>📊 三大指數總覽</b>
+每個指數一行，格式：emoji <b>名稱</b> <code>價格</code> <code>漲跌幅</code>
+附 1~2 句整體氛圍解讀
 
-章節三｜<b>🔥 昨日焦點個股</b>（最多 5 支，無異動可為 0）
-篩選：漲跌>3%、量比>2x、距52週高±3%、有新聞催化、RSI超買超賣、MA50突破
+<b>🔮 七巨頭動態</b>
+最強/最弱各 1 支重點點評（2~3 句），其餘 5 支用精簡列表帶過
+附 1 句整體科技股意涵
+
+<b>🔥 昨日焦點個股</b>（最多 5 支，無異動可為 0）
+篩選條件：漲跌>3%、量比>2x、距52週高/低±3%、有新聞催化、RSI 超買超賣、MA50 突破
 每支格式：
-📌 <b>[產業]｜[名稱]（[代碼]）</b>
-💰 <b>$價格</b>  emoji <b>漲跌幅</b>  📦 量能 <b>均量倍數x</b>
-📊 RSI <b>值</b>  MA20 <b>±%</b>  MA50 <b>±%</b>（無數據略去）
-🔍 <b>焦點：</b>一句話
-📋 <b>背景：</b>兩句產業趨勢
-👁 <b>後市關注：</b>技術面觀察點
-禁止：支撐阻力位精確數字、捏造財報升評
+📌 <b>[產業]｜[名稱]</b>（<code>代碼</code>）
+   💰 <code>$價格</code>  emoji <code>漲跌幅</code>  📦 <code>均量倍數x</code>
+   📊 RSI <code>值</code> · MA20 <code>±%</code> · MA50 <code>±%</code>（無數據略去）
+   🔍 <b>焦點：</b>一句話催化劑
+   📋 <b>背景：</b>兩句產業脈絡
+   👁 <b>關注：</b>後市技術觀察點
+禁止：支撐阻力位精確數字、捏造財報或分析師升降評
 
-章節四｜<b>📰 宏觀背景</b>
-市場情緒 / 總經動態 / 財報 / 外部因素
+<b>📰 宏觀背景</b>
+分項簡述：市場情緒 / 總經動態 / 財報季 / 外部因素（每項 1~2 句）
 
-章節五｜<b>🔄 產業輪動觀察</b>
-領漲 / 領跌 / 資金流向
+<b>🔄 產業輪動</b>
+領漲產業 / 領跌產業 / 資金流向判讀（3~5 句）
 
-章節六｜<b>🎯 後市三情境</b>
-多頭 / 空頭 / 中性，各附整數關卡
+<b>🎯 後市三情境</b>
+  🟢 <b>多頭：</b>條件 + S&P 整數關卡
+  🔴 <b>空頭：</b>條件 + S&P 整數關卡
+  ⚪ <b>中性：</b>盤整區間
 
-章節七｜<b>⚠️ 本週風險雷達</b>
-重要數據日期 + 最大不確定性
+<b>⚠️ 本週風險雷達</b>
+以列表呈現：重要數據日期 + 最大不確定性（2~4 項）
 
-章節八｜<b>🗞️ 財經新聞分析</b>（3~5 則，無新聞則寫「今日無重大財經新聞」）
-每則：新聞摘要 → 相關個股漲跌 → 市場解讀
+<b>🗞️ 財經新聞分析</b>（3~5 則，無新聞寫「今日無重大財經新聞」）
+每則格式：
+▸ <b>標題摘要</b>
+   相關個股漲跌 → 市場解讀（2 句內）
 
-最後固定輸出：
-<i>⚠️ 本報告由 AI 自動生成，數據來源 Yahoo Finance / Finnhub，僅供參考，不構成投資建議。</i>`;
+最後不需要加免責聲明（系統會自動附加）。`;
 }
 
 // ─────────────────────────────────────────────
@@ -761,7 +779,7 @@ async function runStockReport() {
 
     if (totalFetched === 0) {
       log('STOCK', '❌ 所有數據源均失敗');
-      await sendTelegram(`⚠️ <b>美股日報無法生成</b>\n原因：股價數據均無法取得\n時間：${new Date().toLocaleString('zh-TW')}`);
+      await sendTelegram(`<b>⚠️ 美股日報無法生成</b>\n\n原因：所有股價數據源均無回應\n時間：${new Date().toLocaleString('zh-TW')}`);
       return;
     }
 
@@ -779,13 +797,22 @@ async function runStockReport() {
     const { dateStr, weekday, timeStr } = fmtDateHeader();
     const spx     = marketData.indices.find(x => x.symbol === '^GSPC');
     const vix     = marketData.indices.find(x => x.symbol === '^VIX');
-    const summary = [
-      spx?.quote ? `S&P ${spx.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(spx.quote.changePct).toFixed(2)}%` : '',
-      vix?.quote?.price ? `VIX ${fmt(vix.quote.price)}` : '',
-    ].filter(Boolean).join('  ');
+    const dji     = marketData.indices.find(x => x.symbol === '^DJI');
+    const ixic    = marketData.indices.find(x => x.symbol === '^IXIC');
 
-    const header = `<b>📈 美股日報｜${dateStr} ${weekday}</b>\n<i>${summary}  ${timeStr} 發布</i>\n${'─'.repeat(28)}\n\n`;
-    const footer = `\n\n${'─'.repeat(28)}\n<i>🤖 GPT-4o · Yahoo Finance / Finnhub · 僅供參考</i>`;
+    // 快速摘要列：三大指數 + VIX 一行看完
+    const quickParts = [];
+    if (spx?.quote?.changePct != null) quickParts.push(`S&P ${spx.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(spx.quote.changePct).toFixed(2)}%`);
+    if (dji?.quote?.changePct != null) quickParts.push(`道瓊 ${dji.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(dji.quote.changePct).toFixed(2)}%`);
+    if (ixic?.quote?.changePct != null) quickParts.push(`那指 ${ixic.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(ixic.quote.changePct).toFixed(2)}%`);
+    if (vix?.quote?.price) quickParts.push(`VIX ${fmt(vix.quote.price)}`);
+
+    const header = `<b>📈 美股日報</b>｜${dateStr} ${weekday}\n` +
+      `<code>${quickParts.join('  ')}</code>\n` +
+      `${'━'.repeat(24)}\n\n`;
+    const footer = `\n\n${'━'.repeat(24)}\n` +
+      `<i>🤖 GPT-4o · Yahoo Finance / Finnhub</i>\n` +
+      `<i>⏱ ${timeStr} 發布 · 僅供參考，不構成投資建議</i>`;
     const programSection = '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
     const fullReport = header + report + programSection + footer;
 
@@ -795,8 +822,8 @@ async function runStockReport() {
       let msg = chunks[i];
       if (chunks.length > 1) {
         msg += i < chunks.length - 1
-          ? `\n\n<i>── 第 ${i + 1}/${chunks.length} 段，續下則 ──</i>`
-          : `\n\n<i>── 第 ${i + 1}/${chunks.length} 段（完）──</i>`;
+          ? `\n\n<i>━ ${i + 1}/${chunks.length} ━ 續下則 ▸</i>`
+          : `\n\n<i>━ ${i + 1}/${chunks.length} ━ 完 ━</i>`;
       }
       await sendTelegram(msg);
       if (i < chunks.length - 1) await sleep(1500);
@@ -804,7 +831,7 @@ async function runStockReport() {
     log('STOCK', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('STOCK', `❌ 失敗：${err.message}`);
-    await sendTelegram(`⚠️ 美股日報失敗\n時間：${new Date().toLocaleString('zh-TW')}\n錯誤：${err.message}`).catch(() => {});
+    await sendTelegram(`<b>❌ 美股日報執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
     runningLocks.stock = false;
   }
@@ -890,23 +917,40 @@ function buildNewsMessage(articles, aiData) {
     '⚪️ 一般': enriched.filter(a => a.importance <= 3),
   };
 
-  const { dateStr, weekday } = fmtDateHeader();
+  const { dateStr, weekday, timeStr } = fmtDateHeader();
 
-  let msg = `<b>📰 AI 科技新聞摘要｜${dateStr} ${weekday}</b>\n`;
-  msg += `<i>OpenAI Blog · MIT Tech Review · The Verge AI · TechCrunch AI</i>\n`;
-  msg += `${'─'.repeat(28)}\n\n`;
+  let msg = `<b>📰 AI 科技新聞摘要</b>｜${dateStr} ${weekday}\n`;
+  msg += `${'━'.repeat(24)}\n\n`;
+
+  const totalCount = enriched.length;
+  const mustRead   = groups['🔴 必讀'].length;
+  const important  = groups['🟡 重要'].length;
+  if (totalCount > 0) {
+    msg += `<i>📊 今日 ${totalCount} 篇`;
+    if (mustRead > 0 || important > 0) {
+      const parts = [];
+      if (mustRead > 0) parts.push(`${mustRead} 篇必讀`);
+      if (important > 0) parts.push(`${important} 篇重要`);
+      msg += `（${parts.join('、')}）`;
+    }
+    msg += `</i>\n\n`;
+  }
 
   for (const [label, list] of Object.entries(groups)) {
     if (list.length === 0) continue;
     msg += `<b>${label}</b>\n`;
     for (const a of list) {
-      const tags = a.tags.length > 0 ? ` <i>[${a.tags.join(' · ')}]</i>` : '';
-      msg += `▸ ${a.summary_zh}${tags}\n`;
-      if (a.link) msg += `  📌 <a href="${a.link}">${a.source}</a>\n`;
+      const tags = a.tags.length > 0 ? `  <i>${a.tags.join(' · ')}</i>` : '';
+      const importanceBar = a.importance === 5 ? '🔺' : a.importance === 4 ? '▸' : '·';
+      msg += `${importanceBar} <b>${a.summary_zh}</b>${tags}\n`;
+      if (a.link) msg += `   <a href="${a.link}">${a.source}</a>\n`;
       msg += '\n';
     }
   }
-  msg += `${'─'.repeat(28)}\n<i>🤖 GPT-4o-mini 摘要 · 僅供參考</i>`;
+
+  msg += `${'━'.repeat(24)}\n`;
+  msg += `<i>🤖 GPT-4o-mini 摘要 · ${timeStr} 發布</i>\n`;
+  msg += `<i>來源：OpenAI · MIT Tech · The Verge · TechCrunch</i>`;
   return msg;
 }
 
@@ -936,7 +980,7 @@ async function runNewsReport() {
     log('NEWS', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('NEWS', `❌ 失敗：${err.message}`);
-    await sendTelegram(`⚠️ AI 新聞摘要失敗\n錯誤：${err.message}`).catch(() => {});
+    await sendTelegram(`<b>❌ AI 新聞摘要執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
     runningLocks.news = false;
   }
@@ -1078,43 +1122,42 @@ ${stockText}`;
 // 組合快訊 Telegram 訊息
 // ─────────────────────────────────────────────
 function buildFlashMessage(analyzed) {
-  const { dateStr, weekday } = fmtDateHeader();
+  const { dateStr, weekday, timeStr } = fmtDateHeader();
 
-  let msg = `<b>⚡ 美股新聞快訊｜${dateStr} ${weekday}</b>\n`;
-  msg += `<i>昨日重大事件整理 · Finnhub / Yahoo Finance</i>\n`;
-  msg += `${'─'.repeat(28)}\n`;
+  const totalCount = analyzed.market.length + analyzed.stocks.length;
+  let msg = `<b>⚡ 美股新聞快訊</b>｜${dateStr} ${weekday}\n`;
+  msg += `${'━'.repeat(24)}\n`;
 
   // ── 大盤事件 ──
+  msg += `\n<b>🌐 大盤事件</b>\n`;
   if (analyzed.market.length > 0) {
-    msg += `\n<b>🌐 大盤重大事件</b>\n`;
     for (const item of analyzed.market) {
-      const badge = item.importance === 5 ? '🔴' : '🟡';
+      const badge = item.importance === 5 ? '🔺' : '▸';
       msg += `${badge} <b>${item.summary_zh}</b>`;
-      if (item.category) msg += `  <i>[${item.category}]</i>`;
+      if (item.category) msg += `  <i>${item.category}</i>`;
       msg += '\n';
     }
   } else {
-    msg += `\n<b>🌐 大盤重大事件</b>\n⚪️ 昨日無重大總經或地緣事件\n`;
+    msg += `  <i>昨日無重大總經或地緣事件</i>\n`;
   }
 
   // ── 個股快訊 ──
+  msg += `\n<b>📌 個股快訊</b>\n`;
   if (analyzed.stocks.length > 0) {
-    msg += `\n<b>📌 個股快訊</b>\n`;
-
-    // 按重要性排序，再按 category 分組
     const sorted = [...analyzed.stocks].sort((a, b) => b.importance - a.importance);
     for (const item of sorted) {
-      const badge = item.importance === 5 ? '🔴' : '🟡';
-      msg += `${badge} <b>${item.name}（${item.symbol}）</b>`;
-      if (item.category) msg += ` <i>[${item.category}]</i>`;
+      const badge = item.importance === 5 ? '🔺' : '▸';
+      msg += `${badge} <b>${item.name}</b>（<code>${item.symbol}</code>）`;
+      if (item.category) msg += `  <i>${item.category}</i>`;
       msg += `\n   ${item.summary_zh}\n`;
     }
   } else {
-    msg += `\n<b>📌 個股快訊</b>\n⚪️ 昨日池內個股無重大事件\n`;
+    msg += `  <i>昨日池內個股無重大事件</i>\n`;
   }
 
-  msg += `\n${'─'.repeat(28)}\n`;
-  msg += `<i>⚠️ AI 自動整理，僅供參考，不構成投資建議</i>`;
+  msg += `\n${'━'.repeat(24)}\n`;
+  msg += `<i>⚡ ${totalCount} 則重要新聞 · ${timeStr} 發布</i>\n`;
+  msg += `<i>來源：Finnhub / Yahoo Finance · 僅供參考</i>`;
   return msg;
 }
 
@@ -1155,7 +1198,7 @@ async function runFlashReport() {
     log('FLASH', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('FLASH', `❌ 失敗：${err.message}`);
-    await sendTelegram(`⚠️ 美股新聞快訊失敗\n錯誤：${err.message}`).catch(() => {});
+    await sendTelegram(`<b>❌ 美股新聞快訊執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
     runningLocks.flash = false;
   }
@@ -1244,7 +1287,7 @@ function sendRawTelegram(text, parseMode = 'HTML') {
 
 function splitMessage(text, maxLen = 3800) {
   if (text.length <= maxLen) return [text];
-  const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️🗞️])/g;
+  const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡])/g;
   const sections   = text.split(SECTION_RE);
   const chunks     = [];
   let current      = '';
@@ -1275,17 +1318,28 @@ async function startPolling() {
         const chatId = String(upd.message?.chat?.id || '');
         if (chatId !== CHAT_ID) continue;
         if (text === '/ping') {
-          await sendRawTelegram(
-            `🟢 Bot 運作正常\n版本：v5.2\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}\n記憶體：${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
+          const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+          const uptime = Math.floor(process.uptime());
+          const uptimeStr = uptime >= 3600
+            ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
+            : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
+          await sendTelegram(
+            `<b>🟢 系統狀態</b>\n` +
+            `${'━'.repeat(20)}\n` +
+            `  版本　 <code>v5.2</code>\n` +
+            `  狀態　 正常運作中\n` +
+            `  記憶體 <code>${mem} MB</code>\n` +
+            `  運行　 <code>${uptimeStr}</code>\n` +
+            `  時間　 ${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`
           );
         } else if (text === '/news') {
-          await sendRawTelegram('⏳ 手動觸發 AI 新聞摘要...');
+          await sendTelegram('⏳ <b>AI 新聞摘要</b>生成中，請稍候...');
           runNewsReport().catch(e => log('NEWS', `手動失敗: ${e.message}`));
         } else if (text === '/stock') {
-          await sendRawTelegram('⏳ 手動觸發美股日報...');
+          await sendTelegram('⏳ <b>美股日報</b>生成中，請稍候...');
           runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
         } else if (text === '/flash') {
-          await sendRawTelegram('⏳ 手動觸發美股新聞快訊...');
+          await sendTelegram('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
           runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
         }
       }
@@ -1390,11 +1444,17 @@ async function main() {
   startPolling();
 
   await sendTelegram(
-    `🟢 <b>美股日報 + AI 科技新聞 Bot v5.2 啟動</b>\n\n` +
-    `📊 美股日報：週一至週五 07:30\n` +
-    `⚡ 美股新聞快訊：週一至週五 07:40\n` +
-    `📰 AI 科技新聞：每天 07:35\n\n` +
-    `指令：\n/ping — 確認 Bot 存活\n/stock — 立即觸發美股日報\n/flash — 立即觸發美股新聞快訊\n/news — 立即觸發 AI 新聞`
+    `<b>🟢 Bot v5.2 已啟動</b>\n` +
+    `${'━'.repeat(20)}\n\n` +
+    `<b>📋 每日排程</b>\n` +
+    `  <code>07:30</code>  📈 美股日報（週一至週五）\n` +
+    `  <code>07:35</code>  📰 AI 科技新聞（每天）\n` +
+    `  <code>07:40</code>  ⚡ 美股新聞快訊（週一至週五）\n\n` +
+    `<b>🎮 指令</b>\n` +
+    `  /ping — 系統狀態\n` +
+    `  /stock — 觸發美股日報\n` +
+    `  /news — 觸發 AI 新聞\n` +
+    `  /flash — 觸發新聞快訊`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');
