@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報 + AI 科技新聞 整合機器人 v5.0
+// 美股日報 + AI 科技新聞 整合機器人 v5.2
 //
 // ─── 雙通報架構 ─────────────────────────────────────────
 //  📊 訊息一：美股日報（07:30，週一至週五）
@@ -28,6 +28,17 @@
 //  ✅ HTTP 健康檢查 server（供 Zeabur keepalive）
 //  ✅ Telegram 訊息超長自動切分（4096 字元限制）
 //  ✅ 整合進單一進程，不再需要 n8n
+//
+// ─── v5.2 改善 ──────────────────────────────────────────
+//  ✅ OpenAI client 單例化（減少重複建立開銷）
+//  ✅ Finnhub HTTP 請求去重（提取共用 finnhubGet）
+//  ✅ 批次並行抓取（collectFlashNews / fetchKeyStockNews）
+//  ✅ Telegram 發送加入指數退避重試（最多 3 次）
+//  ✅ 完善美股休市日清單（含浮動假日計算）
+//  ✅ 版本號統一為 v5.2
+//  ✅ 報告執行鎖（防止 cron + 手動重複觸發）
+//  ✅ 日期格式化共用函式（消除 4 處重複）
+//  ✅ Graceful shutdown（SIGTERM/SIGINT 優雅關閉）
 // ═══════════════════════════════════════════════════════════
 
 'use strict';
@@ -72,6 +83,24 @@ const NEWS_STOCK_LIMIT  = 3;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log   = (tag, msg) => console.log(`[${new Date().toISOString()}] [${tag}] ${msg}`);
+
+// OpenAI client 單例（避免每次呼叫重新建立）
+const openaiClient = new OpenAI({ apiKey: OPENAI_KEY });
+
+// 報告執行鎖（防止同一報告被重複觸發）
+const runningLocks = { stock: false, news: false, flash: false };
+
+// 批次並行執行工具（每批 batchSize 個，批次間休息 delayMs）
+async function batchParallel(items, fn, batchSize = 5, delayMs = 300) {
+  const results = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+    if (i + batchSize < items.length) await sleep(delayMs);
+  }
+  return results;
+}
 
 // ═══════════════════════════════════════════════════════════
 // PART 1：美股日報
@@ -197,53 +226,48 @@ const SECTOR_STOCKS = {
 };
 
 // ─────────────────────────────────────────────
-// Finnhub 新聞
+// Finnhub 共用 HTTP GET（消除重複樣板）
 // ─────────────────────────────────────────────
-function fetchFinnhubNews() {
+function finnhubGet(apiPath) {
   return new Promise((resolve) => {
-    if (!FINNHUB_KEY) { resolve([]); return; }
-    const now       = new Date();
-    const today     = now.toISOString().split('T')[0];
-    const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
-    const path = `/api/v1/news?category=general&from=${yesterday}&to=${today}&token=${FINNHUB_KEY}`;
-    https.get({ hostname: 'finnhub.io', path }, (res) => {
+    if (!FINNHUB_KEY) { resolve(null); return; }
+    const fullPath = `${apiPath}${apiPath.includes('?') ? '&' : '?'}token=${FINNHUB_KEY}`;
+    https.get({ hostname: 'finnhub.io', path: fullPath }, (res) => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        try {
-          const articles = JSON.parse(data);
-          if (!Array.isArray(articles)) { resolve([]); return; }
-          const headlines = articles
-            .filter(a => a.headline && a.headline.length > 10)
-            .slice(0, NEWS_MARKET_LIMIT)
-            .map(a => `• ${a.headline}`);
-          log('FINNHUB', `取得 ${headlines.length} 條市場新聞`);
-          resolve(headlines);
-        } catch { resolve([]); }
+        try { resolve(JSON.parse(data)); } catch { resolve(null); }
       });
-    }).on('error', () => resolve([]));
+    }).on('error', () => resolve(null));
   });
 }
 
-function fetchStockNews(symbol) {
-  return new Promise((resolve) => {
-    if (!FINNHUB_KEY) { resolve([]); return; }
-    const now       = new Date();
-    const today     = now.toISOString().split('T')[0];
-    const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
-    const path = `/api/v1/company-news?symbol=${symbol}&from=${yesterday}&to=${today}&token=${FINNHUB_KEY}`;
-    https.get({ hostname: 'finnhub.io', path }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const articles = JSON.parse(data);
-          if (!Array.isArray(articles)) { resolve([]); return; }
-          resolve(articles.slice(0, NEWS_STOCK_LIMIT).map(a => a.headline).filter(Boolean));
-        } catch { resolve([]); }
-      });
-    }).on('error', () => resolve([]));
-  });
+// ─────────────────────────────────────────────
+// Finnhub 新聞
+// ─────────────────────────────────────────────
+async function fetchFinnhubNews() {
+  if (!FINNHUB_KEY) return [];
+  const now       = new Date();
+  const today     = now.toISOString().split('T')[0];
+  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
+  const articles  = await finnhubGet(`/api/v1/news?category=general&from=${yesterday}&to=${today}`);
+  if (!Array.isArray(articles)) return [];
+  const headlines = articles
+    .filter(a => a.headline && a.headline.length > 10)
+    .slice(0, NEWS_MARKET_LIMIT)
+    .map(a => `• ${a.headline}`);
+  log('FINNHUB', `取得 ${headlines.length} 條市場新聞`);
+  return headlines;
+}
+
+async function fetchStockNews(symbol) {
+  if (!FINNHUB_KEY) return [];
+  const now       = new Date();
+  const today     = now.toISOString().split('T')[0];
+  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
+  const articles  = await finnhubGet(`/api/v1/company-news?symbol=${symbol}&from=${yesterday}&to=${today}`);
+  if (!Array.isArray(articles)) return [];
+  return articles.slice(0, NEWS_STOCK_LIMIT).map(a => a.headline).filter(Boolean);
 }
 
 async function fetchKeyStockNews(marketData) {
@@ -256,11 +280,15 @@ async function fetchKeyStockNews(marketData) {
   const targets = new Map();
   for (const s of MAG7)      targets.set(s.symbol, s.name);
   for (const s of topMovers) targets.set(s.symbol, s.name);
+  const targetList = [...targets.entries()];
+  const results = await batchParallel(
+    targetList,
+    async ([symbol]) => ({ symbol, headlines: await fetchStockNews(symbol) }),
+    5, 300
+  );
   const newsMap = {};
-  for (const [symbol, name] of targets) {
-    const headlines = await fetchStockNews(symbol);
-    if (headlines.length > 0) newsMap[symbol] = { name, headlines };
-    await sleep(300);
+  for (const { symbol, headlines } of results) {
+    if (headlines.length > 0) newsMap[symbol] = { name: targets.get(symbol), headlines };
   }
   log('FINNHUB', `取得 ${Object.keys(newsMap).length} 支個股新聞`);
   return newsMap;
@@ -269,28 +297,16 @@ async function fetchKeyStockNews(marketData) {
 // ─────────────────────────────────────────────
 // Finnhub 股票報價備援
 // ─────────────────────────────────────────────
-function fetchQuoteFromFinnhub(symbol) {
-  return new Promise((resolve) => {
-    if (!FINNHUB_KEY) { resolve(null); return; }
-    const path = `/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`;
-    https.get({ hostname: 'finnhub.io', path }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const q = JSON.parse(data);
-          if (!q || q.c == null || q.c === 0) { resolve(null); return; }
-          resolve({
-            symbol, price: q.c, change: q.d ?? null, changePct: q.dp ?? null,
-            prevClose: q.pc ?? null, open: q.o ?? null, high: q.h ?? null, low: q.l ?? null,
-            volume: null, avgVolume: null, marketCap: null,
-            fiftyTwoWeekHigh: null, fiftyTwoWeekLow: null, earningsDate: null,
-            shortName: symbol, _source: 'Finnhub',
-          });
-        } catch { resolve(null); }
-      });
-    }).on('error', () => resolve(null));
-  });
+async function fetchQuoteFromFinnhub(symbol) {
+  const q = await finnhubGet(`/api/v1/quote?symbol=${encodeURIComponent(symbol)}`);
+  if (!q || q.c == null || q.c === 0) return null;
+  return {
+    symbol, price: q.c, change: q.d ?? null, changePct: q.dp ?? null,
+    prevClose: q.pc ?? null, open: q.o ?? null, high: q.h ?? null, low: q.l ?? null,
+    volume: null, avgVolume: null, marketCap: null,
+    fiftyTwoWeekHigh: null, fiftyTwoWeekLow: null, earningsDate: null,
+    shortName: symbol, _source: 'Finnhub',
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -394,6 +410,13 @@ async function fetchAllMarketData() {
 // ─────────────────────────────────────────────
 // 格式化工具
 // ─────────────────────────────────────────────
+function fmtDateHeader() {
+  const now     = new Date();
+  const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
+  const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
+  const timeStr = now.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  return { dateStr, weekday, timeStr };
+}
 function fmt(num, digits = 2) {
   if (num == null) return 'N/A';
   return num.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
@@ -649,13 +672,71 @@ ${stockNewsSection}
 // ─────────────────────────────────────────────
 // 非交易日判斷
 // ─────────────────────────────────────────────
+// 美股休市日計算（含浮動假日）
+function getUSMarketHolidays(year) {
+  const holidays = [];
+  // 固定假日
+  holidays.push(`${year}-01-01`); // 元旦
+  holidays.push(`${year}-06-19`); // 六月節 Juneteenth
+  holidays.push(`${year}-07-04`); // 獨立紀念日
+  holidays.push(`${year}-12-25`); // 聖誕節
+
+  // 浮動假日：第 N 個週一/週四
+  const nthWeekday = (month, weekday, n) => {
+    const first = new Date(year, month - 1, 1);
+    let d = ((weekday - first.getDay()) + 7) % 7 + 1;
+    d += (n - 1) * 7;
+    return new Date(year, month - 1, d);
+  };
+  const lastWeekday = (month, weekday) => {
+    const last = new Date(year, month, 0); // 月底
+    const diff = (last.getDay() - weekday + 7) % 7;
+    return new Date(year, month - 1, last.getDate() - diff);
+  };
+
+  const mlk        = nthWeekday(1, 1, 3);  // 1月第3個週一：MLK Day
+  const presidents = nthWeekday(2, 1, 3);  // 2月第3個週一：總統日
+  const memorial   = lastWeekday(5, 1);    // 5月最後一個週一：陣亡將士紀念日
+  const labor      = nthWeekday(9, 1, 1);  // 9月第1個週一：勞動節
+  const thanksgiving = nthWeekday(11, 4, 4); // 11月第4個週四：感恩節
+
+  for (const d of [mlk, presidents, memorial, labor, thanksgiving]) {
+    holidays.push(d.toISOString().split('T')[0]);
+  }
+
+  // 耶穌受難日（復活節前2天，需計算）
+  // 使用 Anonymous Gregorian algorithm
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  const goodFriday = new Date(year, month - 1, day - 2);
+  holidays.push(goodFriday.toISOString().split('T')[0]);
+
+  // 固定假日若遇週六→週五休，遇週日→週一休
+  return holidays.map(dateStr => {
+    const dt = new Date(dateStr + 'T12:00:00');
+    const dow = dt.getDay();
+    if (dow === 6) dt.setDate(dt.getDate() - 1); // 週六 → 週五
+    if (dow === 0) dt.setDate(dt.getDate() + 1); // 週日 → 週一
+    return dt.toISOString().split('T')[0];
+  });
+}
+
 function isTradingDay() {
   const now  = new Date();
   const day  = now.getDay();
   if (day === 0 || day === 6) { log('STOCK', '週末，跳過'); return false; }
-  const holidays = ['1/1', '7/4', '12/25'];
-  const md = `${now.getMonth() + 1}/${now.getDate()}`;
-  if (holidays.includes(md)) { log('STOCK', `公假（${md}），跳過`); return false; }
+  const todayStr = now.toISOString().split('T')[0];
+  const holidays = getUSMarketHolidays(now.getFullYear());
+  if (holidays.includes(todayStr)) {
+    log('STOCK', `美股休市日（${todayStr}），跳過`);
+    return false;
+  }
   return true;
 }
 
@@ -664,6 +745,8 @@ function isTradingDay() {
 // ─────────────────────────────────────────────
 async function runStockReport() {
   if (!isTradingDay()) return;
+  if (runningLocks.stock) { log('STOCK', '⚠️ 美股日報正在執行中，跳過重複觸發'); return; }
+  runningLocks.stock = true;
   const startTime = Date.now();
   log('STOCK', '🚀 開始執行美股日報');
 
@@ -693,10 +776,7 @@ async function runStockReport() {
     const report = await callOpenAI(prompt, 'gpt-4o', 4500);
     log('STOCK', `GPT 完成（${report.length} 字）`);
 
-    const now     = new Date();
-    const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
-    const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
-    const timeStr = now.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+    const { dateStr, weekday, timeStr } = fmtDateHeader();
     const spx     = marketData.indices.find(x => x.symbol === '^GSPC');
     const vix     = marketData.indices.find(x => x.symbol === '^VIX');
     const summary = [
@@ -725,6 +805,8 @@ async function runStockReport() {
   } catch (err) {
     log('STOCK', `❌ 失敗：${err.message}`);
     await sendTelegram(`⚠️ 美股日報失敗\n時間：${new Date().toLocaleString('zh-TW')}\n錯誤：${err.message}`).catch(() => {});
+  } finally {
+    runningLocks.stock = false;
   }
 }
 
@@ -808,9 +890,7 @@ function buildNewsMessage(articles, aiData) {
     '⚪️ 一般': enriched.filter(a => a.importance <= 3),
   };
 
-  const now     = new Date();
-  const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
-  const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
+  const { dateStr, weekday } = fmtDateHeader();
 
   let msg = `<b>📰 AI 科技新聞摘要｜${dateStr} ${weekday}</b>\n`;
   msg += `<i>OpenAI Blog · MIT Tech Review · The Verge AI · TechCrunch AI</i>\n`;
@@ -831,6 +911,8 @@ function buildNewsMessage(articles, aiData) {
 }
 
 async function runNewsReport() {
+  if (runningLocks.news) { log('NEWS', '⚠️ AI 新聞摘要正在執行中，跳過重複觸發'); return; }
+  runningLocks.news = true;
   log('NEWS', '🚀 開始抓取 AI 科技新聞');
   const startTime = Date.now();
   try {
@@ -855,6 +937,8 @@ async function runNewsReport() {
   } catch (err) {
     log('NEWS', `❌ 失敗：${err.message}`);
     await sendTelegram(`⚠️ AI 新聞摘要失敗\n錯誤：${err.message}`).catch(() => {});
+  } finally {
+    runningLocks.news = false;
   }
 }
 
@@ -910,33 +994,22 @@ async function collectFlashNews() {
     for (const s of stocks) allSymbols.set(s.symbol, s.name);
   }
 
-  // 3. 個股新聞：Finnhub 優先，失敗或空則補 Yahoo Finance
-  const stockArticles = [];
-  let count = 0;
-  for (const [symbol, name] of allSymbols) {
+  // 3. 個股新聞：Finnhub 優先，失敗或空則補 Yahoo Finance（批次並行）
+  const symbolList = [...allSymbols.entries()];
+  const batchResults = await batchParallel(symbolList, async ([symbol, name]) => {
     // Finnhub 個股新聞
-    let headlines = [];
     if (FINNHUB_KEY) {
-      headlines = await fetchStockNews(symbol); // 已有此函式，回傳 string[]
-      await sleep(250);
-    }
-
-    if (headlines.length > 0) {
-      for (const title of headlines) {
-        stockArticles.push({ title, link: '', source: 'Finnhub', symbol, name, pubTime: Date.now() });
+      const headlines = await fetchStockNews(symbol);
+      if (headlines.length > 0) {
+        return headlines.map(title => ({ title, link: '', source: 'Finnhub', symbol, name, pubTime: Date.now() }));
       }
-    } else {
-      // 備援：Yahoo Finance 個股新聞
-      const yahooNews = await fetchYahooStockNews(symbol, 3);
-      for (const n of yahooNews) {
-        stockArticles.push({ ...n, name });
-      }
-      await sleep(150);
     }
-    count++;
-    if (count % 20 === 0) log('FLASH', `已掃描 ${count}/${allSymbols.size} 支個股...`);
-  }
+    // 備援：Yahoo Finance 個股新聞
+    const yahooNews = await fetchYahooStockNews(symbol, 3);
+    return yahooNews.map(n => ({ ...n, name }));
+  }, 5, 300);
 
+  const stockArticles = batchResults.flat();
   log('FLASH', `個股新聞原料：${stockArticles.length} 條（${allSymbols.size} 支個股）`);
   return { marketNews, stockArticles };
 }
@@ -1005,9 +1078,7 @@ ${stockText}`;
 // 組合快訊 Telegram 訊息
 // ─────────────────────────────────────────────
 function buildFlashMessage(analyzed) {
-  const now     = new Date();
-  const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
-  const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
+  const { dateStr, weekday } = fmtDateHeader();
 
   let msg = `<b>⚡ 美股新聞快訊｜${dateStr} ${weekday}</b>\n`;
   msg += `<i>昨日重大事件整理 · Finnhub / Yahoo Finance</i>\n`;
@@ -1052,6 +1123,8 @@ function buildFlashMessage(analyzed) {
 // ─────────────────────────────────────────────
 async function runFlashReport() {
   if (!isTradingDay()) return;
+  if (runningLocks.flash) { log('FLASH', '⚠️ 美股新聞快訊正在執行中，跳過重複觸發'); return; }
+  runningLocks.flash = true;
   const startTime = Date.now();
   log('FLASH', '🚀 開始執行美股新聞快訊');
 
@@ -1083,6 +1156,8 @@ async function runFlashReport() {
   } catch (err) {
     log('FLASH', `❌ 失敗：${err.message}`);
     await sendTelegram(`⚠️ 美股新聞快訊失敗\n錯誤：${err.message}`).catch(() => {});
+  } finally {
+    runningLocks.flash = false;
   }
 }
 
@@ -1091,11 +1166,10 @@ async function runFlashReport() {
 // ═══════════════════════════════════════════════════════════
 
 async function callOpenAI(prompt, model = 'gpt-4o', maxTokens = 2000, retries = 3) {
-  const openai = new OpenAI({ apiKey: OPENAI_KEY });
   for (let i = 1; i <= retries; i++) {
     try {
       log('OPENAI', `呼叫 ${model}（第 ${i} 次）...`);
-      const res = await openai.chat.completions.create({
+      const res = await openaiClient.chat.completions.create({
         model,
         messages: [
           {
@@ -1118,15 +1192,26 @@ async function callOpenAI(prompt, model = 'gpt-4o', maxTokens = 2000, retries = 
   }
 }
 
-async function sendTelegram(text) {
-  try {
-    return await sendRawTelegram(text, 'HTML');
-  } catch (err) {
-    if (err.message.includes("can't parse") || err.message.includes('Bad Request')) {
-      log('TG', '⚠️ HTML 失敗，降級純文字');
-      return await sendRawTelegram(text.replace(/<[^>]+>/g, ''), null);
+async function sendTelegram(text, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await sendRawTelegram(text, 'HTML');
+    } catch (err) {
+      // HTML 解析失敗 → 降級純文字（不重試）
+      if (err.message.includes("can't parse") || err.message.includes('Bad Request')) {
+        log('TG', '⚠️ HTML 失敗，降級純文字');
+        return await sendRawTelegram(text.replace(/<[^>]+>/g, ''), null);
+      }
+      // 網路/限速錯誤 → 指數退避重試
+      if (attempt < retries) {
+        const delay = attempt * 2000;
+        log('TG', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
+        await sleep(delay);
+      } else {
+        log('TG', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
+        throw err;
+      }
     }
-    throw err;
   }
 }
 
@@ -1191,7 +1276,7 @@ async function startPolling() {
         if (chatId !== CHAT_ID) continue;
         if (text === '/ping') {
           await sendRawTelegram(
-            `🟢 Bot 運作正常\n版本：v5.1\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}\n記憶體：${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
+            `🟢 Bot 運作正常\n版本：v5.2\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}\n記憶體：${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`
           );
         } else if (text === '/news') {
           await sendRawTelegram('⏳ 手動觸發 AI 新聞摘要...');
@@ -1234,7 +1319,7 @@ function startWatchdog() {
 function startHealthServer() {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', version: 'v5.0', time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: 'ok', version: 'v5.2', time: new Date().toISOString() }));
   });
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => log('HTTP', `健康檢查啟動 port ${PORT}`));
@@ -1251,11 +1336,35 @@ process.on('unhandledRejection', (reason) => {
   log('ERROR', `❌ 未處理 Promise 拒絕: ${reason}`);
 });
 
+// ─────────────────────────────────────────────
+// Graceful Shutdown（讓進行中的報告完成後再退出）
+// ─────────────────────────────────────────────
+let isShuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  log('MAIN', `⚠️ 收到 ${signal}，準備優雅關閉...`);
+
+  // 等待進行中的報告完成（最多等 60 秒）
+  const maxWait = 60000;
+  const start   = Date.now();
+  while (Object.values(runningLocks).some(Boolean) && Date.now() - start < maxWait) {
+    const running = Object.entries(runningLocks).filter(([, v]) => v).map(([k]) => k);
+    log('MAIN', `等待報告完成：${running.join(', ')}...`);
+    await sleep(3000);
+  }
+
+  log('MAIN', '👋 Bot 已關閉');
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+
 // ═══════════════════════════════════════════════════════════
 // 主程式
 // ═══════════════════════════════════════════════════════════
 async function main() {
-  log('MAIN', '🚀 美股日報 + AI 科技新聞 Bot v5.0 啟動');
+  log('MAIN', '🚀 美股日報 + AI 科技新聞 Bot v5.2 啟動');
 
   cron.schedule(STOCK_SCHEDULE, () => {
     log('CRON', '⏰ 觸發美股日報排程');
@@ -1281,7 +1390,7 @@ async function main() {
   startPolling();
 
   await sendTelegram(
-    `🟢 <b>美股日報 + AI 科技新聞 Bot v5.1 啟動</b>\n\n` +
+    `🟢 <b>美股日報 + AI 科技新聞 Bot v5.2 啟動</b>\n\n` +
     `📊 美股日報：週一至週五 07:30\n` +
     `⚡ 美股新聞快訊：週一至週五 07:40\n` +
     `📰 AI 科技新聞：每天 07:35\n\n` +
