@@ -1,6 +1,6 @@
 {
   "name": "stock-report-bot",
-  "version": "5.0.0",
+  "version": "5.2.0",
   "description": "美股日報 + AI 科技新聞整合機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram",
   "main": "index.js",
   "scripts": {
