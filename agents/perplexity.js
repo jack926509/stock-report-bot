@@ -13,17 +13,20 @@ function getClient() {
   return _client;
 }
 
+const PERPLEXITY_TIMEOUT_MS = 30000;
+
 async function perplexitySearch(content, recency = 'day', maxTokens = 1000) {
-  const resp = await getClient().chat.completions.create({
-    model: 'sonar',
-    messages: [{ role: 'user', content }],
-    search_recency_filter: recency,
-    max_tokens: maxTokens,
-  });
-  return {
-    text: resp.choices[0].message.content,
-    citations: resp.citations || [],
-  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PERPLEXITY_TIMEOUT_MS);
+  try {
+    const resp = await getClient().chat.completions.create(
+      { model: 'sonar', messages: [{ role: 'user', content }], search_recency_filter: recency, max_tokens: maxTokens },
+      { signal: controller.signal }
+    );
+    return { text: resp.choices[0].message.content, citations: resp.citations || [] };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchMacroContext() {
