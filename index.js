@@ -50,6 +50,7 @@ const http         = require('http');
 const RssParser    = require('rss-parser');
 const YahooFinance = require('yahoo-finance2').default;
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+const { runAgentsForSymbols, formatAgentSignals } = require('./agents/index');
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -609,7 +610,7 @@ function buildMarketDataSection(marketData) {
 // ─────────────────────────────────────────────
 // GPT-4o 股市報告 Prompt
 // ─────────────────────────────────────────────
-function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}) {
+function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, agentSection = '') {
   const today = new Date().toLocaleDateString('zh-TW', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
   });
@@ -683,7 +684,11 @@ ${stockNewsSection}
 每則格式：
 ▸ <b>標題摘要</b>
    相關個股漲跌 → 市場解讀（2 句內）
-
+${agentSection ? `
+<b>🤖 AI 投資人訊號（MAG7）</b>
+以下是基本面/估值模型對七巨頭的量化評分，請根據技術面資料綜合解讀：
+${agentSection}
+每支股票用 1 句整合技術面與基本面給出綜合看法。` : ''}
 最後不需要加免責聲明（系統會自動附加）。`;
 }
 
@@ -789,8 +794,21 @@ async function runStockReport() {
     const rankingSection  = buildRankingSection(marketData);
     const earningsSection = buildEarningsSection(marketData);
 
+    // AI 投資人 Agent（需 FMP_API_KEY，失敗不影響報告）
+    let agentSection = '';
+    if (process.env.FMP_API_KEY && process.env.DISABLE_AGENTS !== 'true') {
+      try {
+        log('STOCK', '執行 AI 投資人 Agent（MAG7）...');
+        const agentResults = await runAgentsForSymbols(MAG7.map(s => s.symbol));
+        agentSection = formatAgentSignals(agentResults);
+        log('STOCK', `Agent 完成：${agentResults.filter(r => r.agents.length).length} 支有結果`);
+      } catch (e) {
+        log('STOCK', `Agent 執行失敗，略過：${e.message}`);
+      }
+    }
+
     log('STOCK', '呼叫 GPT-4o...');
-    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap);
+    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, agentSection);
     const report = await callOpenAI(prompt, 'gpt-4o', 4500);
     log('STOCK', `GPT 完成（${report.length} 字）`);
 
