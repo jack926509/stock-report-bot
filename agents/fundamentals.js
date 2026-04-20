@@ -32,7 +32,7 @@ async function runFundamentalsAgent(symbol) {
   if (m.pbRatio > 0 && m.pbRatio < 3)  { bullish++; details.push(`P/B ${m.pbRatio.toFixed(1)}`); } else bearish++;
 
   const total = bullish + bearish;
-  const confidence = Math.round((bullish / total) * 100);
+  const confidence = total > 0 ? Math.round((bullish / total) * 100) : 50;
   const signal = confidence >= 65 ? 'BUY' : confidence <= 40 ? 'SELL' : 'NEUTRAL';
 
   return { agent: '基本面', symbol, signal, confidence, details: details.slice(0, 3).join('、') };

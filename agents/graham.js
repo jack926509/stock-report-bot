@@ -8,22 +8,18 @@ async function runGrahamAgent(symbol) {
   if (!m) return null;
 
   // Graham Number = sqrt(22.5 × EPS × BookValuePerShare)
-  // FMP key-metrics provides: eps, bookValuePerShare, grahamNumber (sometimes)
-  const eps  = m.grahamNumber ? null : m.eps;           // prefer pre-calculated
-  const bvps = m.grahamNumber ? null : m.bookValuePerShare;
-  const price = m.marketCap && m.sharesOutstanding
-    ? m.marketCap / m.sharesOutstanding
-    : null;
-
+  // Prefer FMP pre-calculated value; fall back to manual formula
   let grahamNum = null;
-  if (m.grahamNumber && m.grahamNumber > 0) {
+  if (m.grahamNumber > 0) {
     grahamNum = m.grahamNumber;
-  } else if (eps > 0 && bvps > 0) {
-    grahamNum = Math.sqrt(22.5 * eps * bvps);
+  } else if (m.eps > 0 && m.bookValuePerShare > 0) {
+    grahamNum = Math.sqrt(22.5 * m.eps * m.bookValuePerShare);
   }
 
-  // Need current price — fall back to peRatio × eps if no price
-  const currentPrice = price || (m.peRatio > 0 && eps > 0 ? m.peRatio * eps : null);
+  // Current price: marketCap/shares → P/E × EPS fallback (eps always available here)
+  const currentPrice = (m.marketCap && m.sharesOutstanding)
+    ? m.marketCap / m.sharesOutstanding
+    : (m.peRatio > 0 && m.eps > 0 ? m.peRatio * m.eps : null);
 
   if (!grahamNum || !currentPrice) {
     return { agent: 'Graham', symbol, signal: 'NEUTRAL', confidence: 50, details: '估值資料不足' };
