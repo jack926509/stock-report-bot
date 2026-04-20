@@ -51,6 +51,7 @@ const RssParser    = require('rss-parser');
 const YahooFinance = require('yahoo-finance2').default;
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
 const { runAgentsForSymbols, formatAgentSignals } = require('./agents/index');
+const { fetchMacroContext, fetchAINews, fetchStockCatalyst } = require('./agents/perplexity');
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -610,7 +611,7 @@ function buildMarketDataSection(marketData) {
 // ─────────────────────────────────────────────
 // GPT-4o 股市報告 Prompt
 // ─────────────────────────────────────────────
-function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, agentSection = '') {
+function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, agentSection = '', macroContext = '', catalystMap = {}) {
   const today = new Date().toLocaleDateString('zh-TW', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
   });
@@ -618,12 +619,20 @@ function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, agentSec
   const newsSection = newsHeadlines.length > 0
     ? `=== 今日財經新聞標題（昨日真實頭條）===\n${newsHeadlines.join('\n')}`
     : `=== 今日財經新聞 ===\n（新聞資料未取得，宏觀背景請只描述市場氛圍，不引用具體數字）`;
+  const macroSection = macroContext
+    ? `\n=== 今日宏觀即時資訊（Perplexity 即時搜尋）===\n${macroContext}\n`
+    : '';
   let stockNewsSection = '';
-  if (Object.keys(stockNewsMap).length > 0) {
-    stockNewsSection = '\n=== 重點個股新聞（昨日真實標題）===\n';
-    for (const [symbol, { name, headlines }] of Object.entries(stockNewsMap)) {
+  if (Object.keys(stockNewsMap).length > 0 || Object.keys(catalystMap).length > 0) {
+    stockNewsSection = '\n=== 重點個股新聞 ===\n';
+    const allSymbols = new Set([...Object.keys(stockNewsMap), ...Object.keys(catalystMap)]);
+    for (const symbol of allSymbols) {
+      const entry = stockNewsMap[symbol];
+      const catalyst = catalystMap[symbol];
+      const name = entry?.name || symbol;
       stockNewsSection += `\n【${name}（${symbol}）】\n`;
-      headlines.forEach(h => { stockNewsSection += `• ${h}\n`; });
+      if (catalyst) stockNewsSection += `📡 即時催化劑：${catalyst}\n`;
+      entry?.headlines?.forEach(h => { stockNewsSection += `• ${h}\n`; });
     }
   }
 
@@ -632,7 +641,7 @@ function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, agentSec
 ${dataSection}
 
 ${newsSection}
-${stockNewsSection}
+${macroSection}${stockNewsSection}
 
 === 排版規範 ===
 - 語言：繁體中文
@@ -774,9 +783,12 @@ async function runStockReport() {
   log('STOCK', '🚀 開始執行美股日報');
 
   try {
-    const [marketData, newsHeadlines] = await Promise.all([
+    const hasPerplexity = !!(process.env.PERPLEXITY_API_KEY && process.env.DISABLE_PERPLEXITY !== 'true');
+
+    const [marketData, newsHeadlines, macroResult] = await Promise.all([
       fetchAllMarketData(),
       fetchFinnhubNews(),
+      hasPerplexity ? fetchMacroContext().catch(e => { log('STOCK', `宏觀搜尋失敗，略過：${e.message}`); return null; }) : Promise.resolve(null),
     ]);
 
     const totalFetched = marketData.indices.length + marketData.mag7.length +
@@ -788,8 +800,30 @@ async function runStockReport() {
       return;
     }
 
+    const macroContext = macroResult?.text || '';
+    if (macroContext) log('STOCK', '✅ 宏觀即時資訊取得');
+
     log('STOCK', '抓取重點個股新聞...');
     const stockNewsMap = await fetchKeyStockNews(marketData);
+
+    // Perplexity 催化劑：對漲跌幅 >3% 的個股搜尋即時原因
+    const catalystMap = {};
+    if (hasPerplexity) {
+      const allStocks = [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()];
+      const bigMovers = allStocks
+        .filter(s => s.quote?.changePct != null && Math.abs(s.quote.changePct) >= 3)
+        .slice(0, 5); // 最多 5 支，控制 API 用量
+      if (bigMovers.length > 0) {
+        log('STOCK', `搜尋 ${bigMovers.length} 支異動股催化劑...`);
+        await Promise.all(bigMovers.map(async s => {
+          try {
+            const r = await fetchStockCatalyst(s.symbol, s.name);
+            if (r?.text) catalystMap[s.symbol] = r.text;
+          } catch { /* 單支失敗不影響整體 */ }
+        }));
+        log('STOCK', `催化劑取得：${Object.keys(catalystMap).length} 支`);
+      }
+    }
 
     const rankingSection  = buildRankingSection(marketData);
     const earningsSection = buildEarningsSection(marketData);
@@ -808,7 +842,7 @@ async function runStockReport() {
     }
 
     log('STOCK', '呼叫 GPT-4o...');
-    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, agentSection);
+    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, agentSection, macroContext, catalystMap);
     const report = await callOpenAI(prompt, 'gpt-4o', 4500);
     log('STOCK', `GPT 完成（${report.length} 字）`);
 
@@ -828,8 +862,11 @@ async function runStockReport() {
     const header = `<b>📈 美股日報</b>｜${dateStr} ${weekday}\n` +
       `<code>${quickParts.join('  ')}</code>\n` +
       `${'━'.repeat(24)}\n\n`;
+    const sources = ['GPT-4o', 'Yahoo Finance'];
+    if (FINNHUB_KEY) sources.push('Finnhub');
+    if (macroContext) sources.push('Perplexity');
     const footer = `\n\n${'━'.repeat(24)}\n` +
-      `<i>🤖 GPT-4o · Yahoo Finance / Finnhub</i>\n` +
+      `<i>🤖 ${sources.join(' · ')}</i>\n` +
       `<i>⏱ ${timeStr} 發布 · 僅供參考，不構成投資建議</i>`;
     const programSection = '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
     const fullReport = header + report + programSection + footer;
@@ -978,17 +1015,50 @@ async function runNewsReport() {
   log('NEWS', '🚀 開始抓取 AI 科技新聞');
   const startTime = Date.now();
   try {
-    const results = await Promise.all(RSS_FEEDS.map(fetchRss));
-    const all     = dedup(results.flat());
-    log('NEWS', `共 ${all.length} 篇（去重後）`);
+    const hasPerplexity = !!(process.env.PERPLEXITY_API_KEY && process.env.DISABLE_PERPLEXITY !== 'true');
 
-    if (all.length === 0) {
-      await sendTelegram('📰 AI 科技新聞摘要：今日 24 小時內無最新文章。');
-      return;
+    // Perplexity 路徑：一次搜尋取代 4 個 RSS + GPT 評分
+    let message = null;
+    if (hasPerplexity) {
+      try {
+        log('NEWS', 'Perplexity 搜尋今日 AI 新聞...');
+        const result = await fetchAINews();
+        const parsed = JSON.parse(result.text.replace(/```json|```/g, '').trim());
+        if (parsed?.articles?.length > 0) {
+          // 轉換為 buildNewsMessage 相容格式
+          const articles = parsed.articles.map((a, i) => ({
+            id: i + 1, title: a.title, link: a.url || '', content: '', source: a.source || 'Perplexity',
+          }));
+          const aiData = {
+            articles: parsed.articles.map((a, i) => ({
+              id: i + 1, summary_zh: a.summary_zh || a.title, importance: a.importance || 3, tags: a.tags || [],
+            })),
+          };
+          message = buildNewsMessage(articles, aiData).replace(
+            '<i>來源：OpenAI · MIT Tech · The Verge · TechCrunch</i>',
+            '<i>來源：Perplexity 即時網路搜尋</i>'
+          );
+          log('NEWS', `Perplexity 取得 ${parsed.articles.length} 篇`);
+        }
+      } catch (e) {
+        log('NEWS', `Perplexity 失敗，降級 RSS：${e.message}`);
+      }
     }
 
-    const aiResult = await analyzeNews(all);
-    const message  = buildNewsMessage(all, aiResult);
+    // RSS 備援路徑（Perplexity 未設定或失敗時）
+    if (!message) {
+      const results = await Promise.all(RSS_FEEDS.map(fetchRss));
+      const all     = dedup(results.flat());
+      log('NEWS', `RSS 共 ${all.length} 篇（去重後）`);
+
+      if (all.length === 0) {
+        await sendTelegram('📰 AI 科技新聞摘要：今日 24 小時內無最新文章。');
+        return;
+      }
+
+      const aiResult = await analyzeNews(all);
+      message = buildNewsMessage(all, aiResult);
+    }
     const chunks   = splitMessage(message, 3800);
 
     for (let i = 0; i < chunks.length; i++) {
