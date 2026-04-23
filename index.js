@@ -57,6 +57,8 @@ const https        = require('https');
 const http         = require('http');
 const YahooFinance = require('yahoo-finance2').default;
 const yahooFinance = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+const { runAgentsForSymbols, formatAgentSignals } = require('./agents/index');
+const { fetchMacroContext, fetchStockCatalyst } = require('./agents/perplexity');
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
@@ -95,6 +97,13 @@ const openaiClient = new OpenAI({ apiKey: OPENAI_KEY });
 
 // 報告執行鎖（防止同一報告被重複觸發）
 const runningLocks = { stock: false, flash: false };
+const LOCK_TIMEOUT_MS = 12 * 60 * 1000; // 12 分鐘後強制釋放鎖
+
+// 技術指標參數常數
+const RSI_PERIOD = 14;
+const BB_PERIOD  = 20;
+const MA_SHORT   = 20;
+const MA_LONG    = 50;
 
 // 批次並行執行工具（每批 batchSize 個，批次間休息 delayMs）
 async function batchParallel(items, fn, batchSize = 5, delayMs = 300) {
@@ -560,12 +569,12 @@ function calcBollinger(closes, period = 20) {
   return { upper: ma + 2 * std, lower: ma - 2 * std, ma };
 }
 function calculateIndicators(closes) {
-  if (!closes || closes.length < 15) return null;
+  if (!closes || closes.length < RSI_PERIOD + 1) return null;
   const last    = closes[closes.length - 1];
-  const rsi14   = calcRSI(closes, 14);
-  const ma20    = calcSMA(closes, 20);
-  const ma50    = calcSMA(closes, 50);
-  const boll    = calcBollinger(closes, 20);
+  const rsi14   = calcRSI(closes, RSI_PERIOD);
+  const ma20    = calcSMA(closes, MA_SHORT);
+  const ma50    = calcSMA(closes, MA_LONG);
+  const boll    = calcBollinger(closes, BB_PERIOD);
   const ma20pct = ma20 ? ((last - ma20) / ma20 * 100) : null;
   const ma50pct = ma50 ? ((last - ma50) / ma50 * 100) : null;
   const bollPct = boll && boll.upper !== boll.lower
@@ -699,7 +708,7 @@ function buildMarketDataSection(marketData) {
 // ─────────────────────────────────────────────
 // GPT-4o 股市報告 Prompt
 // ─────────────────────────────────────────────
-function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, breadth = null) {
+function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, breadth = null, agentSection = '', macroContext = '', catalystMap = {}) {
   const today = new Date().toLocaleDateString('zh-TW', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
   });
@@ -707,12 +716,20 @@ function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, breadth 
   const newsSection = newsHeadlines.length > 0
     ? `=== 今日財經新聞標題（昨日真實頭條）===\n${newsHeadlines.join('\n')}`
     : `=== 今日財經新聞 ===\n（新聞資料未取得，宏觀背景請只描述市場氛圍，不引用具體數字）`;
+  const macroSection = macroContext
+    ? `\n=== 今日宏觀即時資訊（Perplexity 即時搜尋）===\n${macroContext}\n`
+    : '';
   let stockNewsSection = '';
-  if (Object.keys(stockNewsMap).length > 0) {
-    stockNewsSection = '\n=== 重點個股新聞（昨日真實標題）===\n';
-    for (const [symbol, { name, headlines }] of Object.entries(stockNewsMap)) {
+  if (Object.keys(stockNewsMap).length > 0 || Object.keys(catalystMap).length > 0) {
+    stockNewsSection = '\n=== 重點個股新聞 ===\n';
+    const allSymbols = new Set([...Object.keys(stockNewsMap), ...Object.keys(catalystMap)]);
+    for (const symbol of allSymbols) {
+      const entry = stockNewsMap[symbol];
+      const catalyst = catalystMap[symbol];
+      const name = entry?.name || symbol;
       stockNewsSection += `\n【${name}（${symbol}）】\n`;
-      headlines.forEach(h => { stockNewsSection += `• ${h}\n`; });
+      if (catalyst) stockNewsSection += `📡 即時催化劑：${catalyst}\n`;
+      entry?.headlines?.forEach(h => { stockNewsSection += `• ${h}\n`; });
     }
   }
 
@@ -735,8 +752,9 @@ ${breadth.sortedSectors.map(([name, p]) => `  ${name}: ${p.avg >= 0 ? '+' : ''}$
 ${dataSection}
 
 ${newsSection}
-${stockNewsSection}
+${macroSection}${stockNewsSection}
 ${breadthText}
+
 === 排版規範 ===
 - 語言：繁體中文
 - 格式：只用 Telegram HTML（<b> <i> <code>），禁止 Markdown 語法
@@ -799,15 +817,21 @@ ${breadthText}
 每則格式：
 ▸ <b>標題摘要</b>
    相關個股漲跌 → 市場解讀（2 句內）
-
+${agentSection ? `
+<b>🤖 AI 投資人訊號（MAG7）</b>
+以下是基本面/估值模型對七巨頭的量化評分，請根據技術面資料綜合解讀：
+${agentSection}
+每支股票用 1 句整合技術面與基本面給出綜合看法。` : ''}
 最後不需要加免責聲明（系統會自動附加）。`;
 }
 
 // ─────────────────────────────────────────────
 // 非交易日判斷
 // ─────────────────────────────────────────────
-// 美股休市日計算（含浮動假日）
+// 美股休市日計算（含浮動假日）—— 結果按年快取，避免重複計算
+const _holidayCache = new Map();
 function getUSMarketHolidays(year) {
+  if (_holidayCache.has(year)) return _holidayCache.get(year);
   const holidays = [];
   // 固定假日
   holidays.push(`${year}-01-01`); // 元旦
@@ -852,13 +876,15 @@ function getUSMarketHolidays(year) {
   holidays.push(goodFriday.toISOString().split('T')[0]);
 
   // 固定假日若遇週六→週五休，遇週日→週一休
-  return holidays.map(dateStr => {
+  const result = holidays.map(dateStr => {
     const dt = new Date(dateStr + 'T12:00:00');
     const dow = dt.getDay();
     if (dow === 6) dt.setDate(dt.getDate() - 1); // 週六 → 週五
     if (dow === 0) dt.setDate(dt.getDate() + 1); // 週日 → 週一
     return dt.toISOString().split('T')[0];
   });
+  _holidayCache.set(year, result);
+  return result;
 }
 
 function isTradingDay() {
@@ -881,13 +907,27 @@ async function runStockReport() {
   if (!isTradingDay()) return;
   if (runningLocks.stock) { log('STOCK', '⚠️ 美股日報正在執行中，跳過重複觸發'); return; }
   runningLocks.stock = true;
+  const lockTimer = setTimeout(() => { runningLocks.stock = false; log('STOCK', '⚠️ 執行逾時，強制釋放鎖'); }, LOCK_TIMEOUT_MS);
   const startTime = Date.now();
   log('STOCK', '🚀 開始執行美股日報');
 
   try {
-    const [marketData, newsHeadlines] = await Promise.all([
+    const hasPerplexity = !!(process.env.PERPLEXITY_API_KEY && process.env.DISABLE_PERPLEXITY !== 'true');
+
+    // 宏觀搜尋：失敗時重試一次
+    const macroFetch = hasPerplexity
+      ? (async () => {
+          try { return await fetchMacroContext(); } catch (e1) {
+            await sleep(2000);
+            return fetchMacroContext().catch(e2 => { log('STOCK', `宏觀搜尋失敗，略過：${e2.message}`); return null; });
+          }
+        })()
+      : Promise.resolve(null);
+
+    const [marketData, newsHeadlines, macroResult] = await Promise.all([
       fetchAllMarketData(),
       fetchFinnhubNews(),
+      macroFetch,
     ]);
 
     const totalFetched = marketData.indices.length + marketData.mag7.length +
@@ -899,16 +939,56 @@ async function runStockReport() {
       return;
     }
 
+    const macroContext = macroResult?.text || '';
+    if (macroContext) log('STOCK', '✅ 宏觀即時資訊取得');
+
     log('STOCK', '抓取重點個股新聞...');
     const stockNewsMap = await fetchKeyStockNews(marketData);
 
     const breadth         = buildMarketBreadth(marketData);
     const breadthSection  = fmtBreadthSection(breadth);
+
+    // Perplexity 催化劑：漲跌幅 >3% 且 Finnhub 沒有已取得新聞的個股
+    const catalystMap = {};
+    if (hasPerplexity) {
+      const allStocks = [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()];
+      const bigMovers = allStocks
+        .filter(s =>
+          s.quote?.changePct != null &&
+          Math.abs(s.quote.changePct) >= 3 &&
+          !stockNewsMap[s.symbol]?.headlines?.length
+        )
+        .slice(0, 5);
+      if (bigMovers.length > 0) {
+        log('STOCK', `搜尋 ${bigMovers.length} 支異動股催化劑...`);
+        await Promise.all(bigMovers.map(async s => {
+          try {
+            const r = await fetchStockCatalyst(s.symbol, s.name);
+            if (r?.text) catalystMap[s.symbol] = r.text;
+          } catch { /* 單支失敗不影響整體 */ }
+        }));
+        log('STOCK', `催化劑取得：${Object.keys(catalystMap).length} 支`);
+      }
+    }
+
     const rankingSection  = buildRankingSection(marketData);
     const earningsSection = buildEarningsSection(marketData);
 
+    // AI 投資人 Agent（需 FMP_API_KEY，失敗不影響報告）
+    let agentSection = '';
+    if (process.env.FMP_API_KEY && process.env.DISABLE_AGENTS !== 'true') {
+      try {
+        log('STOCK', '執行 AI 投資人 Agent（MAG7）...');
+        const agentResults = await runAgentsForSymbols(MAG7.map(s => s.symbol));
+        agentSection = formatAgentSignals(agentResults);
+        log('STOCK', `Agent 完成：${agentResults.filter(r => r.agents.length).length} 支有結果`);
+      } catch (e) {
+        log('STOCK', `Agent 執行失敗，略過：${e.message}`);
+      }
+    }
+
     log('STOCK', '呼叫 GPT-4o...');
-    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, breadth);
+    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, breadth, agentSection, macroContext, catalystMap);
     const report = await callOpenAI(prompt, 'gpt-4o', 4500);
     log('STOCK', `GPT 完成（${report.length} 字）`);
 
@@ -928,8 +1008,11 @@ async function runStockReport() {
     const header = `<b>📈 美股日報</b>｜${dateStr} ${weekday}\n` +
       `<code>${quickParts.join('  ')}</code>\n` +
       `${'━'.repeat(24)}\n\n`;
+    const sources = ['GPT-4o', 'Yahoo Finance'];
+    if (FINNHUB_KEY) sources.push('Finnhub');
+    if (macroContext) sources.push('Perplexity');
     const footer = `\n\n${'━'.repeat(24)}\n` +
-      `<i>🤖 GPT-4o · Yahoo Finance / Finnhub</i>\n` +
+      `<i>🤖 ${sources.join(' · ')}</i>\n` +
       `<i>⏱ ${timeStr} 發布 · 僅供參考，不構成投資建議</i>`;
     const programSection = '\n\n' + breadthSection + '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
     const fullReport = header + report + programSection + footer;
@@ -951,12 +1034,13 @@ async function runStockReport() {
     log('STOCK', `❌ 失敗：${err.message}`);
     await sendTelegram(`<b>❌ 美股日報執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
+    clearTimeout(lockTimer);
     runningLocks.stock = false;
   }
 }
 
 // ═══════════════════════════════════════════════════════════
-// PART 2：美股新聞快訊（07:40，週一至週五）
+// PART 2：美股新聞快訊（07:35，週一至週五）
 //
 // 每日整理前一交易日的重大美股新聞：
 //  ① Finnhub 市場新聞（一般市場頭條）
@@ -1146,6 +1230,7 @@ async function runFlashReport() {
   if (!isTradingDay()) return;
   if (runningLocks.flash) { log('FLASH', '⚠️ 美股新聞快訊正在執行中，跳過重複觸發'); return; }
   runningLocks.flash = true;
+  const lockTimerFlash = setTimeout(() => { runningLocks.flash = false; log('FLASH', '⚠️ 執行逾時，強制釋放鎖'); }, LOCK_TIMEOUT_MS);
   const startTime = Date.now();
   log('FLASH', '🚀 開始執行美股新聞快訊');
 
@@ -1184,6 +1269,7 @@ async function runFlashReport() {
     log('FLASH', `❌ 失敗：${err.message}`);
     await sendTelegram(`<b>❌ 美股新聞快訊執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
+    clearTimeout(lockTimerFlash);
     runningLocks.flash = false;
   }
 }
