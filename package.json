@@ -1,7 +1,7 @@
 {
   "name": "stock-report-bot",
-  "version": "5.2.0",
-  "description": "美股日報 + AI 科技新聞整合機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram",
+  "version": "5.3.0",
+  "description": "美股日報 + 新聞快訊機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,7 +9,6 @@
   "dependencies": {
     "node-cron": "^3.0.3",
     "openai": "^4.77.0",
-    "rss-parser": "^3.13.0",
     "yahoo-finance2": "^3.3.0"
   },
   "engines": {
