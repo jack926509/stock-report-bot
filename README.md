@@ -100,6 +100,7 @@
 | `TELEGRAM_CHAT_ID` | Telegram 模式必要 | 目標 Telegram 聊天室 ID |
 | `DISCORD_BOT_TOKEN` | Discord 模式必要 | Discord Bot Token |
 | `DISCORD_CHANNEL_ID` | Discord 模式必要 | 目標 Discord 文字頻道 ID |
+| `DISCORD_GUILD_ID` | 選用（建議） | 伺服器 ID。設定後斜線指令會「即時」註冊到該伺服器；不設定則註冊為全域指令（最多約 1 小時才生效） |
 | `FINNHUB_API_KEY` | 選用 | Finnhub API 金鑰（備援報價 + 新聞功能） |
 | `PORT` | 選用 | HTTP 健康檢查 port（預設 3000） |
 | `RUN_NOW` | 選用 | 設為 `true` 啟動後立即執行報告 |
@@ -114,21 +115,22 @@
 1. 前往 <https://discord.com/developers/applications> → 右上角 **New Application**，取個名字（例如 `Stock Report Bot`）。
 2. 左側選單進入 **Bot** 分頁 → **Add Bot** → 確認。
 3. 在 **Bot** 分頁點 **Reset Token** → 複製產生的 Token，這就是 `DISCORD_BOT_TOKEN`（只會顯示一次，請妥善保存）。
-4. 往下找到 **Privileged Gateway Intents**，**開啟 `MESSAGE CONTENT INTENT`**（指令功能需要讀訊息內容）。`SERVER MEMBERS INTENT` / `PRESENCE INTENT` 不需要。
+4. 往下找到 **Privileged Gateway Intents** → **開啟 `MESSAGE CONTENT INTENT`**（給 `!ping` 這類前綴指令用；只用斜線指令的話可不開，但建議開著當備援）。`SERVER MEMBERS INTENT` / `PRESENCE INTENT` 不需要。
 5. （可選）在 **Bot** 分頁把 `PUBLIC BOT` 關掉，避免別人把你的 Bot 加進其他伺服器。
 
 ### 2. 把 Bot 邀請進你的伺服器
 
 1. 左側選單進入 **OAuth2 → URL Generator**。
-2. **Scopes** 勾選 `bot`。
-3. **Bot Permissions** 勾選：`View Channels`、`Send Messages`、`Embed Links`、`Read Message History`。
+2. **Scopes** 勾選 `bot` **和** `applications.commands`（後者是斜線指令必需）。
+3. 下方 **Bot Permissions** 勾選：`View Channels`、`Send Messages`、`Embed Links`、`Read Message History`。
 4. 複製最下方產生的網址，在瀏覽器打開，選擇你的伺服器並授權。
 
-### 3. 取得頻道 ID（`DISCORD_CHANNEL_ID`）
+### 3. 取得頻道 ID（`DISCORD_CHANNEL_ID`）與伺服器 ID（`DISCORD_GUILD_ID`）
 
 1. Discord App → **設定 → 進階 → 開發者模式** 打開。
-2. 在你要接收報告的文字頻道上按右鍵 → **複製頻道 ID**。
-3. 確認該頻道允許 Bot 發言（頻道權限或角色權限）。
+2. 在你要接收報告的文字頻道上按右鍵 → **複製頻道 ID** → 這是 `DISCORD_CHANNEL_ID`。
+3. 在伺服器名稱（左上角）按右鍵 → **複製伺服器 ID** → 這是 `DISCORD_GUILD_ID`（選用，但強烈建議設定，斜線指令才會即時生效）。
+4. 確認該頻道允許 Bot 發言（頻道權限或角色權限）。
 
 ### 4. 設定環境變數並啟動
 
@@ -136,16 +138,19 @@
 MESSAGING_PLATFORM=discord
 DISCORD_BOT_TOKEN=你的BotToken
 DISCORD_CHANNEL_ID=你的頻道ID
+DISCORD_GUILD_ID=你的伺服器ID      # 選用，建議填，斜線指令即時生效
 OPENAI_API_KEY=sk-...
 # FINNHUB_API_KEY=...   # 選用
 ```
 
 ```bash
 npm install
-MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx OPENAI_API_KEY=sk-xxx npm start
+MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx DISCORD_GUILD_ID=xxx OPENAI_API_KEY=sk-xxx npm start
 ```
 
-啟動後 Bot 會在指定頻道發一則「Bot 已啟動」訊息。之後在該頻道輸入 `!ping` / `!stock` / `!flash` 即可測試。
+啟動後 Bot 會在指定頻道發一則「Bot 已啟動」訊息，並自動註冊斜線指令。之後在該頻道輸入 `/ping`、`/stock`、`/flash`（或備援的 `!ping` / `!stock` / `!flash`）即可使用。
+
+> **斜線指令多久生效？** 有設 `DISCORD_GUILD_ID` → 重啟後幾秒內生效；沒設（全域指令）→ 最多約 1 小時。若打 `/` 沒看到指令，先確認邀請時有勾 `applications.commands` scope，再等一下或重新整理 Discord（Ctrl+R）。
 
 > 部署到 Zeabur / Railway 等平台時，把上述變數填到平台的環境變數設定即可，流程與 Telegram 版相同。
 
@@ -178,7 +183,9 @@ RUN_NOW=true RUN_NOW_TARGET=stock node index.js
 
 **新增 Discord 支援**
 - 訊息平台抽象層：新增 `MESSAGING_PLATFORM` 環境變數，可選 `telegram`（預設）或 `discord`
-- Discord 模式使用 `discord.js`：登入 Bot、發送報告到指定文字頻道、監聽 `!ping` / `!stock` / `!flash` 指令
+- Discord 模式使用 `discord.js`：登入 Bot、發送報告到指定文字頻道
+- **原生斜線指令**：啟動時自動註冊 `/ping`、`/stock`、`/flash`；設定 `DISCORD_GUILD_ID` 則即時註冊到該伺服器，否則註冊為全域指令
+- 同時保留 `!ping` / `!stock` / `!flash` 前綴訊息指令作為備援
 - 報告內容仍以 Telegram HTML 撰寫，Discord 模式自動轉成 Markdown（`<b>`→`**`、`<i>`→`*`、`<code>`→`` ` ``）
 - 訊息分段上限改為依平台自動調整（Telegram 3800 / Discord 1900）
 - `gracefulShutdown` 會一併關閉 Discord client

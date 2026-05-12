@@ -95,6 +95,7 @@ const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
 const DISCORD_TOKEN      = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID || null; // 設定後斜線指令即時生效（建議單伺服器使用）
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || null;
 const TIMEZONE    = 'Asia/Taipei';
 
@@ -1423,7 +1424,46 @@ async function initDiscord() {
   }
   log('DISCORD', `✅ 已登入 ${discordClient.user.tag}，目標頻道 #${discordChannel.name || DISCORD_CHANNEL_ID}`);
 
-  // 指令監聽（用 ! 前綴；Discord 內建斜線指令需另外註冊，這裡用最簡單的訊息指令）
+  // ── 註冊原生斜線指令（/ping /stock /flash）──
+  const slashCommands = [
+    { name: 'ping',  description: '系統狀態（版本、平台、記憶體、運行時間）' },
+    { name: 'stock', description: '手動觸發美股日報' },
+    { name: 'flash', description: '手動觸發美股新聞快訊' },
+  ];
+  try {
+    if (DISCORD_GUILD_ID) {
+      const guild = await discordClient.guilds.fetch(DISCORD_GUILD_ID);
+      await guild.commands.set(slashCommands);
+      log('DISCORD', `✅ 已註冊 ${slashCommands.length} 個伺服器斜線指令（guild ${DISCORD_GUILD_ID}，即時生效）`);
+    } else {
+      await discordClient.application.commands.set(slashCommands);
+      log('DISCORD', `✅ 已註冊 ${slashCommands.length} 個全域斜線指令（最多約 1 小時生效；設定 DISCORD_GUILD_ID 可即時生效）`);
+    }
+  } catch (e) {
+    log('DISCORD', `⚠️ 斜線指令註冊失敗（! 前綴指令仍可用）：${e.message}`);
+  }
+
+  // ── 斜線指令處理 ──
+  discordClient.on('interactionCreate', async (interaction) => {
+    try {
+      if (!interaction.isChatInputCommand()) return;
+      if (interaction.channelId && String(interaction.channelId) !== String(DISCORD_CHANNEL_ID)) {
+        await interaction.reply({ content: `請到 <#${DISCORD_CHANNEL_ID}> 使用此指令`, ephemeral: true });
+        return;
+      }
+      if (interaction.commandName === 'ping') {
+        await interaction.reply(htmlToDiscord(buildPingMessage()).slice(0, 2000));
+      } else if (interaction.commandName === 'stock') {
+        await interaction.reply('⏳ **美股日報**生成中，請稍候...');
+        runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+      } else if (interaction.commandName === 'flash') {
+        await interaction.reply('⏳ **美股新聞快訊**生成中，請稍候...');
+        runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+      }
+    } catch (e) { log('DISCORD', `斜線指令處理錯誤: ${e.message}`); }
+  });
+
+  // ── ! 前綴訊息指令（保留作為備援；需 MESSAGE CONTENT INTENT）──
   discordClient.on('messageCreate', async (m) => {
     try {
       if (m.author?.bot) return;
@@ -1626,17 +1666,17 @@ async function main() {
     startPolling();
   }
 
-  const cmdPrefix = PLATFORM === 'discord' ? '!' : '/';
+  const cmdHint = PLATFORM === 'discord' ? '/ 或 !' : '/';
   await sendMessage(
     `<b>🟢 Bot v5.3 已啟動</b>\n` +
     `${'━'.repeat(20)}\n\n` +
     `<b>📋 每日排程</b>（週一至週五）\n` +
     `  <code>07:30</code>  📈 美股日報\n` +
     `  <code>07:35</code>  ⚡ 美股新聞快訊\n\n` +
-    `<b>🎮 指令</b>\n` +
-    `  ${cmdPrefix}ping — 系統狀態\n` +
-    `  ${cmdPrefix}stock — 觸發美股日報\n` +
-    `  ${cmdPrefix}flash — 觸發新聞快訊`
+    `<b>🎮 指令</b>（前綴 ${cmdHint}）\n` +
+    `  ping — 系統狀態\n` +
+    `  stock — 觸發美股日報\n` +
+    `  flash — 觸發新聞快訊`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');
