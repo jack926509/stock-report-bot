@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報 + 新聞快訊 機器人 v5.3
+// 美股日報 + 新聞快訊 機器人 v5.4（Telegram / Discord）
 //
 // ─── 雙通報架構 ─────────────────────────────────────────
 //  📊 訊息一：美股日報（07:30，週一至週五）
@@ -23,9 +23,9 @@
 //  ✅ 移除 Notion 整合（簡化依賴）
 //  ✅ 加入 uncaughtException / unhandledRejection 全局防護
 //  ✅ 看門狗心跳 log（每分鐘，方便 Zeabur 監控）
-//  ✅ /ping /stock /news 指令（隨時確認存活 + 手動觸發）
+//  ✅ /ping /stock /flash 指令（隨時確認存活 + 手動觸發）
 //  ✅ HTTP 健康檢查 server（供 Zeabur keepalive）
-//  ✅ Telegram 訊息超長自動切分（4096 字元限制）
+//  ✅ 訊息超長自動切分（依平台字數上限）
 //  ✅ 整合進單一進程，不再需要 n8n
 //
 // ─── v5.2 改善 ──────────────────────────────────────────
@@ -47,6 +47,13 @@
 //  ✅ GPT prompt 強化數據分析（廣度背離偵測、產業輪動引用）
 //  ✅ 新聞快訊加入指數快照（一眼掌握大盤）
 //  ✅ 快訊排程提前至 07:35
+//
+// ─── v5.4 改善 ──────────────────────────────────────────
+//  ✅ 新增 Discord 平台支援（MESSAGING_PLATFORM=discord）
+//  ✅ Discord 原生斜線指令 /ping /stock /flash（DISCORD_GUILD_ID 可即時生效）
+//  ✅ ! 前綴指令改為可選（DISCORD_ENABLE_PREFIX_COMMANDS），純斜線指令免開 MESSAGE CONTENT INTENT
+//  ✅ 產業個股改為分組並行抓取（縮短日報資料抓取時間）
+//  ✅ 版本字串統一為 APP_VERSION 常數
 // ═══════════════════════════════════════════════════════════
 
 'use strict';
@@ -98,6 +105,10 @@ const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID || null; // 設定後斜線指令即時生效（建議單伺服器使用）
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || null;
 const TIMEZONE    = 'Asia/Taipei';
+const APP_VERSION = 'v5.4';
+
+// Discord：是否啟用 ! 前綴訊息指令（需開 MESSAGE CONTENT INTENT）；純斜線指令可設為 false
+const DISCORD_ENABLE_PREFIX_COMMANDS = process.env.DISCORD_ENABLE_PREFIX_COMMANDS !== 'false';
 
 // 各平台單則訊息字數上限（保留安全邊界）：Telegram 4096 / Discord 2000
 const MSG_LIMIT = PLATFORM === 'discord' ? 1900 : 3800;
@@ -398,13 +409,12 @@ async function fetchAllMarketData() {
     Promise.all(MAG7.map(s => fetchQuote(s.symbol))),
   ]);
 
-  log('STOCK', '抓取各產業個股...');
+  log('STOCK', '抓取各產業個股（分組並行）...');
   const sectorResults = {};
-  for (const [sector, stocks] of Object.entries(SECTOR_STOCKS)) {
-    await sleep(300);
+  await batchParallel(Object.entries(SECTOR_STOCKS), async ([sector, stocks]) => {
     const quotes = await Promise.all(stocks.map(s => fetchQuote(s.symbol)));
     sectorResults[sector] = stocks.map((s, i) => ({ ...s, quote: quotes[i] })).filter(x => x.quote);
-  }
+  }, 3, 300);
   const sectorCount = Object.values(sectorResults).reduce((a, b) => a + b.length, 0);
   log('STOCK', `取得：${indexData.filter(Boolean).length} 指數 / ${mag7Data.filter(Boolean).length} 巨頭 / ${sectorCount} 個股`);
 
@@ -423,13 +433,12 @@ async function fetchAllMarketData() {
     ...sortedByPct.slice(-10).map(s => s.symbol),
   ]);
 
-  log('STOCK', `計算技術指標（${indicatorTargets.size} 支）...`);
+  log('STOCK', `計算技術指標（${indicatorTargets.size} 支，分批並行）...`);
   const indicatorMap = {};
-  for (const symbol of indicatorTargets) {
+  await batchParallel([...indicatorTargets], async (symbol) => {
     const closes = await fetchHistoricalCloses(symbol);
     if (closes) indicatorMap[symbol] = calculateIndicators(closes);
-    await sleep(150);
-  }
+  }, 5, 200);
   log('STOCK', `技術指標完成：${Object.keys(indicatorMap).length} 支`);
 
   const attach = arr => arr.map(s => ({ ...s, indicators: indicatorMap[s.symbol] ?? null }));
@@ -1401,16 +1410,13 @@ let discordClient  = null;
 let discordChannel = null;
 
 async function initDiscord() {
-  const { Client, GatewayIntentBits, Partials } = require('discord.js');
-  discordClient = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-      GatewayIntentBits.DirectMessages,
-    ],
-    partials: [Partials.Channel],
-  });
+  const { Client, GatewayIntentBits, Partials, MessageFlags } = require('discord.js');
+  const intents = [GatewayIntentBits.Guilds];
+  if (DISCORD_ENABLE_PREFIX_COMMANDS) {
+    // ! 前綴指令需要讀訊息內容（MESSAGE CONTENT 為 privileged intent，須在開發者後台開啟）
+    intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+  }
+  discordClient = new Client({ intents, partials: [Partials.Channel] });
   discordClient.on('error', e => log('DISCORD', `client error: ${e.message}`));
   discordClient.on('warn',  m => log('DISCORD', `warn: ${m}`));
 
@@ -1440,7 +1446,7 @@ async function initDiscord() {
       log('DISCORD', `✅ 已註冊 ${slashCommands.length} 個全域斜線指令（最多約 1 小時生效；設定 DISCORD_GUILD_ID 可即時生效）`);
     }
   } catch (e) {
-    log('DISCORD', `⚠️ 斜線指令註冊失敗（! 前綴指令仍可用）：${e.message}`);
+    log('DISCORD', `⚠️ 斜線指令註冊失敗（重啟可重試；若有開前綴指令仍可用）：${e.message}`);
   }
 
   // ── 斜線指令處理 ──
@@ -1448,7 +1454,7 @@ async function initDiscord() {
     try {
       if (!interaction.isChatInputCommand()) return;
       if (interaction.channelId && String(interaction.channelId) !== String(DISCORD_CHANNEL_ID)) {
-        await interaction.reply({ content: `請到 <#${DISCORD_CHANNEL_ID}> 使用此指令`, ephemeral: true });
+        await interaction.reply({ content: `請到 <#${DISCORD_CHANNEL_ID}> 使用此指令`, flags: MessageFlags.Ephemeral });
         return;
       }
       if (interaction.commandName === 'ping') {
@@ -1463,23 +1469,28 @@ async function initDiscord() {
     } catch (e) { log('DISCORD', `斜線指令處理錯誤: ${e.message}`); }
   });
 
-  // ── ! 前綴訊息指令（保留作為備援；需 MESSAGE CONTENT INTENT）──
-  discordClient.on('messageCreate', async (m) => {
-    try {
-      if (m.author?.bot) return;
-      if (String(m.channelId) !== String(DISCORD_CHANNEL_ID)) return;
-      const cmd = m.content.trim().toLowerCase();
-      if (cmd === '!ping') {
-        await sendMessage(buildPingMessage());
-      } else if (cmd === '!stock') {
-        await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
-        runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
-      } else if (cmd === '!flash') {
-        await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
-        runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
-      }
-    } catch (e) { log('DISCORD', `指令處理錯誤: ${e.message}`); }
-  });
+  // ── ! 前綴訊息指令（可選；需 MESSAGE CONTENT INTENT，設 DISCORD_ENABLE_PREFIX_COMMANDS=false 可關閉）──
+  if (DISCORD_ENABLE_PREFIX_COMMANDS) {
+    discordClient.on('messageCreate', async (m) => {
+      try {
+        if (m.author?.bot) return;
+        if (String(m.channelId) !== String(DISCORD_CHANNEL_ID)) return;
+        const cmd = m.content.trim().toLowerCase();
+        if (cmd === '!ping') {
+          await sendMessage(buildPingMessage());
+        } else if (cmd === '!stock') {
+          await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
+          runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+        } else if (cmd === '!flash') {
+          await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
+          runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+        }
+      } catch (e) { log('DISCORD', `指令處理錯誤: ${e.message}`); }
+    });
+    log('DISCORD', '✅ ! 前綴指令已啟用（需 MESSAGE CONTENT INTENT）');
+  } else {
+    log('DISCORD', 'ℹ️ ! 前綴指令已停用，僅使用斜線指令');
+  }
 }
 
 async function sendDiscord(text, retries = 3) {
@@ -1533,7 +1544,7 @@ function buildPingMessage() {
     : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
   return `<b>🟢 系統狀態</b>\n` +
     `${'━'.repeat(20)}\n` +
-    `  版本　 <code>v5.3</code>\n` +
+    `  版本　 <code>${APP_VERSION}</code>\n` +
     `  平台　 <code>${PLATFORM}</code>\n` +
     `  狀態　 正常運作中\n` +
     `  記憶體 <code>${mem} MB</code>\n` +
@@ -1595,7 +1606,7 @@ function startWatchdog() {
 function startHealthServer() {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', version: 'v5.3', time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: 'ok', version: APP_VERSION, platform: PLATFORM, time: new Date().toISOString() }));
   });
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => log('HTTP', `健康檢查啟動 port ${PORT}`));
@@ -1642,7 +1653,7 @@ process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 // 主程式
 // ═══════════════════════════════════════════════════════════
 async function main() {
-  log('MAIN', `🚀 美股日報 Bot v5.3 啟動（訊息平台：${PLATFORM}）`);
+  log('MAIN', `🚀 美股日報 Bot ${APP_VERSION} 啟動（訊息平台：${PLATFORM}）`);
 
   cron.schedule(STOCK_SCHEDULE, () => {
     log('CRON', '⏰ 觸發美股日報排程');
@@ -1666,9 +1677,11 @@ async function main() {
     startPolling();
   }
 
-  const cmdHint = PLATFORM === 'discord' ? '/ 或 !' : '/';
+  const cmdHint = PLATFORM === 'discord'
+    ? (DISCORD_ENABLE_PREFIX_COMMANDS ? '/ 或 !' : '/')
+    : '/';
   await sendMessage(
-    `<b>🟢 Bot v5.3 已啟動</b>\n` +
+    `<b>🟢 Bot ${APP_VERSION} 已啟動</b>\n` +
     `${'━'.repeat(20)}\n\n` +
     `<b>📋 每日排程</b>（週一至週五）\n` +
     `  <code>07:30</code>  📈 美股日報\n` +

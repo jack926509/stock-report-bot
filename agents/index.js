@@ -1,6 +1,5 @@
 'use strict';
 
-const { clearCache } = require('./fmp');
 const { runFundamentalsAgent } = require('./fundamentals');
 const { runBuffettAgent } = require('./buffett');
 const { runGrahamAgent } = require('./graham');
@@ -17,8 +16,8 @@ async function runAllAgents(symbol) {
 }
 
 // 分批執行，每批 3 支，間隔 500ms 避免 FMP 速率限制
+// 不主動清快取：FMP 取的是日級財務數據，1 小時 TTL 內重複觸發可直接命中快取
 async function runAgentsForSymbols(symbols) {
-  clearCache();
   const results = [];
   for (let i = 0; i < symbols.length; i += 3) {
     const batch = symbols.slice(i, i + 3);

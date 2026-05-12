@@ -49,11 +49,4 @@ async function getCashFlowStatement(symbol, limit = 3) {
   return Array.isArray(data) ? data : [];
 }
 
-function clearCache() { cache.clear(); }
-
-function pruneExpiredCache() {
-  const now = Date.now();
-  for (const [k, v] of cache) { if (now >= v.expiresAt) cache.delete(k); }
-}
-
-module.exports = { getKeyMetrics, getFinancialRatios, getCashFlowStatement, clearCache, pruneExpiredCache };
+module.exports = { getKeyMetrics, getFinancialRatios, getCashFlowStatement };

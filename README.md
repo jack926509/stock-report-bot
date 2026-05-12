@@ -15,11 +15,11 @@
 
 | Telegram | Discord | 功能 |
 |----------|---------|------|
-| `/ping`  | `!ping`  | 系統狀態（版本、平台、記憶體、運行時間） |
-| `/stock` | `!stock` | 手動觸發美股日報 |
-| `/flash` | `!flash` | 手動觸發美股新聞快訊 |
+| `/ping`  | `/ping`（或 `!ping`）  | 系統狀態（版本、平台、記憶體、運行時間） |
+| `/stock` | `/stock`（或 `!stock`） | 手動觸發美股日報 |
+| `/flash` | `/flash`（或 `!flash`） | 手動觸發美股新聞快訊 |
 
-> Telegram 用 `/` 前綴（Bot polling）；Discord 用 `!` 前綴的一般訊息指令（不需註冊 slash command）。指令只在設定的聊天室／頻道內生效。
+> Telegram 用 `/` 前綴（Bot polling）。Discord 啟動時會自動註冊原生斜線指令 `/ping` `/stock` `/flash`；另外預設也支援 `!` 前綴訊息指令（需 MESSAGE CONTENT INTENT，可用 `DISCORD_ENABLE_PREFIX_COMMANDS=false` 關閉）。指令只在設定的聊天室／頻道內生效。
 
 ## 技術架構
 
@@ -101,12 +101,21 @@
 | `DISCORD_BOT_TOKEN` | Discord 模式必要 | Discord Bot Token |
 | `DISCORD_CHANNEL_ID` | Discord 模式必要 | 目標 Discord 文字頻道 ID |
 | `DISCORD_GUILD_ID` | 選用（建議） | 伺服器 ID。設定後斜線指令會「即時」註冊到該伺服器；不設定則註冊為全域指令（最多約 1 小時才生效） |
-| `FINNHUB_API_KEY` | 選用 | Finnhub API 金鑰（備援報價 + 新聞功能） |
+| `DISCORD_ENABLE_PREFIX_COMMANDS` | 選用 | 預設 `true`。是否啟用 `!ping` / `!stock` / `!flash` 前綴指令（需開 MESSAGE CONTENT INTENT）。只用斜線指令的話設 `false`，就不必開那個 privileged intent |
+| `FINNHUB_API_KEY` | 選用 | Finnhub API 金鑰（備援報價 + 新聞快訊功能） |
+| `PERPLEXITY_API_KEY` | 選用 | Perplexity Sonar 金鑰（日報的宏觀即時資訊 + 異動股催化劑） |
+| `DISABLE_PERPLEXITY` | 選用 | 設為 `true` 可在有金鑰時仍關閉 Perplexity |
+| `FMP_API_KEY` | 選用 | Financial Modeling Prep 金鑰（AI 投資人 Agent：基本面 / Buffett / Graham） |
+| `DISABLE_AGENTS` | 選用 | 設為 `true` 可在有金鑰時仍關閉投資人 Agent |
 | `PORT` | 選用 | HTTP 健康檢查 port（預設 3000） |
 | `RUN_NOW` | 選用 | 設為 `true` 啟動後立即執行報告 |
 | `RUN_NOW_TARGET` | 選用 | 搭配 `RUN_NOW`，可選 `stock` / `flash` |
 
-> 只需設定其中一組（Telegram **或** Discord）。兩組都設定時，由 `MESSAGING_PLATFORM` 決定用哪一個。
+> 訊息平台只需設定其中一組（Telegram **或** Discord）。兩組都設定時，由 `MESSAGING_PLATFORM` 決定用哪一個。完整範本見 [`.env.example`](.env.example)。
+>
+> 最小可跑設定：
+> - Telegram：`OPENAI_API_KEY` + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
+> - Discord：`OPENAI_API_KEY` + `MESSAGING_PLATFORM=discord` + `DISCORD_BOT_TOKEN` + `DISCORD_CHANNEL_ID`（建議再加 `DISCORD_GUILD_ID`）
 
 ## Discord 設定教學
 
@@ -115,7 +124,10 @@
 1. 前往 <https://discord.com/developers/applications> → 右上角 **New Application**，取個名字（例如 `Stock Report Bot`）。
 2. 左側選單進入 **Bot** 分頁 → **Add Bot** → 確認。
 3. 在 **Bot** 分頁點 **Reset Token** → 複製產生的 Token，這就是 `DISCORD_BOT_TOKEN`（只會顯示一次，請妥善保存）。
-4. 往下找到 **Privileged Gateway Intents** → **開啟 `MESSAGE CONTENT INTENT`**（給 `!ping` 這類前綴指令用；只用斜線指令的話可不開，但建議開著當備援）。`SERVER MEMBERS INTENT` / `PRESENCE INTENT` 不需要。
+4. 往下找到 **Privileged Gateway Intents**：
+   - 如果要用 `!ping` 這類**前綴指令** → **開啟 `MESSAGE CONTENT INTENT`**。
+   - 如果**只用斜線指令**（`/ping` 等）→ 不必開；並把環境變數 `DISCORD_ENABLE_PREFIX_COMMANDS=false`（沒關掉的話程式會嘗試用前綴指令，未開 intent 會在啟動時報錯）。
+   - `SERVER MEMBERS INTENT` / `PRESENCE INTENT` 都不需要。
 5. （可選）在 **Bot** 分頁把 `PUBLIC BOT` 關掉，避免別人把你的 Bot 加進其他伺服器。
 
 ### 2. 把 Bot 邀請進你的伺服器
@@ -138,14 +150,15 @@
 MESSAGING_PLATFORM=discord
 DISCORD_BOT_TOKEN=你的BotToken
 DISCORD_CHANNEL_ID=你的頻道ID
-DISCORD_GUILD_ID=你的伺服器ID      # 選用，建議填，斜線指令即時生效
+DISCORD_GUILD_ID=你的伺服器ID            # 選用，建議填，斜線指令即時生效
+DISCORD_ENABLE_PREFIX_COMMANDS=true     # 只用斜線指令可改 false（就不必開 MESSAGE CONTENT INTENT）
 OPENAI_API_KEY=sk-...
-# FINNHUB_API_KEY=...   # 選用
+# FINNHUB_API_KEY=...   # 選用，見 .env.example
 ```
 
 ```bash
 npm install
-MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx DISCORD_GUILD_ID=xxx OPENAI_API_KEY=sk-xxx npm start
+npm start    # 環境變數可寫進 .env（自行載入）或由部署平台提供
 ```
 
 啟動後 Bot 會在指定頻道發一則「Bot 已啟動」訊息，並自動註冊斜線指令。之後在該頻道輸入 `/ping`、`/stock`、`/flash`（或備援的 `!ping` / `!stock` / `!flash`）即可使用。
@@ -156,10 +169,14 @@ MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx DISCORD_
 
 ## 部署方式（Zeabur）
 
-1. 在 Zeabur 建立新專案，連結 GitHub repo
-2. 設定環境變數（見上表）
-3. Zeabur 會自動偵測 Node.js 專案並部署
-4. 內建 HTTP 健康檢查 server 可供 Zeabur keepalive 使用
+1. 把 repo push 到 GitHub，在 Zeabur 建立新專案並連結該 repo。
+2. 在 Zeabur 的「環境變數」設定填入需要的變數（見上表）：
+   - Telegram 版：`OPENAI_API_KEY` + `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
+   - Discord 版：`OPENAI_API_KEY` + `MESSAGING_PLATFORM=discord` + `DISCORD_BOT_TOKEN` + `DISCORD_CHANNEL_ID`（建議再加 `DISCORD_GUILD_ID`；只用斜線指令可加 `DISCORD_ENABLE_PREFIX_COMMANDS=false`）
+   - 視需要再加 `FINNHUB_API_KEY` / `PERPLEXITY_API_KEY` / `FMP_API_KEY`
+3. Zeabur 會自動偵測 Node.js 專案 → `npm install` → `npm start`（會一併安裝 `discord.js`）。
+4. 內建 HTTP 健康檢查 server（`PORT`，預設 3000）可供 Zeabur keepalive 使用。
+5. Discord bot 用 Gateway 長連線（非 webhook），常駐環境即可運作，不需要對外網址；重新部署時 `SIGTERM` 會等進行中的報告跑完再退出，斜線指令會在重啟後自動重新註冊。
 
 ### 本機開發
 
@@ -168,13 +185,15 @@ MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx DISCORD_
 npm install
 
 # 設定環境變數
-cp .env.example .env  # 填入你的 API keys
+cp .env.example .env   # 填入你的 API keys
 
-# 啟動
+# 啟動（Node 20.6+ 可用 --env-file 載入 .env）
+node --env-file=.env index.js
+# 或在部署平台已提供環境變數時：
 npm start
 
-# 測試模式（立即執行報告）
-RUN_NOW=true RUN_NOW_TARGET=stock node index.js
+# 測試模式（啟動後立即執行一次報告）
+RUN_NOW=true RUN_NOW_TARGET=stock node --env-file=.env index.js
 ```
 
 ## 修改歷程（Changelog）
@@ -185,10 +204,17 @@ RUN_NOW=true RUN_NOW_TARGET=stock node index.js
 - 訊息平台抽象層：新增 `MESSAGING_PLATFORM` 環境變數，可選 `telegram`（預設）或 `discord`
 - Discord 模式使用 `discord.js`：登入 Bot、發送報告到指定文字頻道
 - **原生斜線指令**：啟動時自動註冊 `/ping`、`/stock`、`/flash`；設定 `DISCORD_GUILD_ID` 則即時註冊到該伺服器，否則註冊為全域指令
-- 同時保留 `!ping` / `!stock` / `!flash` 前綴訊息指令作為備援
+- `!ping` / `!stock` / `!flash` 前綴指令改為**可選**（`DISCORD_ENABLE_PREFIX_COMMANDS`）：關閉時不需要 MESSAGE CONTENT INTENT，純斜線指令部署不會因未開 intent 而崩潰
 - 報告內容仍以 Telegram HTML 撰寫，Discord 模式自動轉成 Markdown（`<b>`→`**`、`<i>`→`*`、`<code>`→`` ` ``）
 - 訊息分段上限改為依平台自動調整（Telegram 3800 / Discord 1900）
 - `gracefulShutdown` 會一併關閉 Discord client
+
+**效能與整理**
+- 產業個股改為**分組並行抓取**（每批 3 個產業），技術指標也改為分批並行（每批 5 支），縮短日報資料抓取時間
+- 版本字串統一為 `APP_VERSION` 常數；健康檢查端點加上 `platform` 欄位
+- FMP 快取：移除每次 Agent 執行時的 `clearCache()`，讓 1 小時 TTL 真正生效（同小時內重複觸發直接命中）
+- 移除死碼：`agents/perplexity.js` 的 `fetchAINews`、`agents/fmp.js` 的 `pruneExpiredCache` / `clearCache`
+- 新增 [`.env.example`](.env.example)，README 補上 `PERPLEXITY_API_KEY` / `FMP_API_KEY` / `DISABLE_*` 等變數說明
 
 ### v5.3.0（2026-04-23）
 
