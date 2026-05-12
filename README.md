@@ -1,6 +1,8 @@
 # Stock Report Bot
 
-美股日報 + 新聞快訊機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram
+美股日報 + 新聞快訊機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram 或 Discord
+
+> 訊息平台可二選一：**Telegram** 或 **Discord**。報告內容、排程、指令都相同，只差在「發到哪裡」。
 
 ## 功能概覽
 
@@ -9,13 +11,15 @@
 | **美股日報** | 週一至週五 07:30 (Asia/Taipei) | 三大指數 + 七巨頭 + 8 大產業 + 技術指標 + 市場廣度 + GPT-4o 分析 |
 | **美股新聞快訊** | 週一至週五 07:35 | 指數快照 + Finnhub/Yahoo 新聞 + GPT-4o-mini 重要性篩選 |
 
-### Telegram 指令
+### 指令
 
-| 指令 | 功能 |
-|------|------|
-| `/ping` | 系統狀態（版本、記憶體、運行時間） |
-| `/stock` | 手動觸發美股日報 |
-| `/flash` | 手動觸發美股新聞快訊 |
+| Telegram | Discord | 功能 |
+|----------|---------|------|
+| `/ping`  | `!ping`  | 系統狀態（版本、平台、記憶體、運行時間） |
+| `/stock` | `!stock` | 手動觸發美股日報 |
+| `/flash` | `!flash` | 手動觸發美股新聞快訊 |
+
+> Telegram 用 `/` 前綴（Bot polling）；Discord 用 `!` 前綴的一般訊息指令（不需註冊 slash command）。指令只在設定的聊天室／頻道內生效。
 
 ## 技術架構
 
@@ -51,7 +55,8 @@
                     ▼
              ┌─────────────┐
              │  Telegram   │
-             │  Bot API    │
+             │     或      │
+             │   Discord   │
              └─────────────┘
 ```
 
@@ -90,12 +95,59 @@
 | 變數 | 必要 | 說明 |
 |------|------|------|
 | `OPENAI_API_KEY` | **必要** | OpenAI API 金鑰 |
-| `TELEGRAM_BOT_TOKEN` | **必要** | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | **必要** | 目標 Telegram 聊天室 ID |
+| `MESSAGING_PLATFORM` | 選用 | `telegram`（預設）或 `discord`。未設定時，若有 `DISCORD_BOT_TOKEN` 會自動切換成 `discord` |
+| `TELEGRAM_BOT_TOKEN` | Telegram 模式必要 | Telegram Bot Token |
+| `TELEGRAM_CHAT_ID` | Telegram 模式必要 | 目標 Telegram 聊天室 ID |
+| `DISCORD_BOT_TOKEN` | Discord 模式必要 | Discord Bot Token |
+| `DISCORD_CHANNEL_ID` | Discord 模式必要 | 目標 Discord 文字頻道 ID |
 | `FINNHUB_API_KEY` | 選用 | Finnhub API 金鑰（備援報價 + 新聞功能） |
 | `PORT` | 選用 | HTTP 健康檢查 port（預設 3000） |
 | `RUN_NOW` | 選用 | 設為 `true` 啟動後立即執行報告 |
 | `RUN_NOW_TARGET` | 選用 | 搭配 `RUN_NOW`，可選 `stock` / `flash` |
+
+> 只需設定其中一組（Telegram **或** Discord）。兩組都設定時，由 `MESSAGING_PLATFORM` 決定用哪一個。
+
+## Discord 設定教學
+
+### 1. 建立 Discord 應用程式與 Bot
+
+1. 前往 <https://discord.com/developers/applications> → 右上角 **New Application**，取個名字（例如 `Stock Report Bot`）。
+2. 左側選單進入 **Bot** 分頁 → **Add Bot** → 確認。
+3. 在 **Bot** 分頁點 **Reset Token** → 複製產生的 Token，這就是 `DISCORD_BOT_TOKEN`（只會顯示一次，請妥善保存）。
+4. 往下找到 **Privileged Gateway Intents**，**開啟 `MESSAGE CONTENT INTENT`**（指令功能需要讀訊息內容）。`SERVER MEMBERS INTENT` / `PRESENCE INTENT` 不需要。
+5. （可選）在 **Bot** 分頁把 `PUBLIC BOT` 關掉，避免別人把你的 Bot 加進其他伺服器。
+
+### 2. 把 Bot 邀請進你的伺服器
+
+1. 左側選單進入 **OAuth2 → URL Generator**。
+2. **Scopes** 勾選 `bot`。
+3. **Bot Permissions** 勾選：`View Channels`、`Send Messages`、`Embed Links`、`Read Message History`。
+4. 複製最下方產生的網址，在瀏覽器打開，選擇你的伺服器並授權。
+
+### 3. 取得頻道 ID（`DISCORD_CHANNEL_ID`）
+
+1. Discord App → **設定 → 進階 → 開發者模式** 打開。
+2. 在你要接收報告的文字頻道上按右鍵 → **複製頻道 ID**。
+3. 確認該頻道允許 Bot 發言（頻道權限或角色權限）。
+
+### 4. 設定環境變數並啟動
+
+```bash
+MESSAGING_PLATFORM=discord
+DISCORD_BOT_TOKEN=你的BotToken
+DISCORD_CHANNEL_ID=你的頻道ID
+OPENAI_API_KEY=sk-...
+# FINNHUB_API_KEY=...   # 選用
+```
+
+```bash
+npm install
+MESSAGING_PLATFORM=discord DISCORD_BOT_TOKEN=xxx DISCORD_CHANNEL_ID=xxx OPENAI_API_KEY=sk-xxx npm start
+```
+
+啟動後 Bot 會在指定頻道發一則「Bot 已啟動」訊息。之後在該頻道輸入 `!ping` / `!stock` / `!flash` 即可測試。
+
+> 部署到 Zeabur / Railway 等平台時，把上述變數填到平台的環境變數設定即可，流程與 Telegram 版相同。
 
 ## 部署方式（Zeabur）
 
@@ -121,6 +173,15 @@ RUN_NOW=true RUN_NOW_TARGET=stock node index.js
 ```
 
 ## 修改歷程（Changelog）
+
+### v5.4.0（2026-05-12）
+
+**新增 Discord 支援**
+- 訊息平台抽象層：新增 `MESSAGING_PLATFORM` 環境變數，可選 `telegram`（預設）或 `discord`
+- Discord 模式使用 `discord.js`：登入 Bot、發送報告到指定文字頻道、監聽 `!ping` / `!stock` / `!flash` 指令
+- 報告內容仍以 Telegram HTML 撰寫，Discord 模式自動轉成 Markdown（`<b>`→`**`、`<i>`→`*`、`<code>`→`` ` ``）
+- 訊息分段上限改為依平台自動調整（Telegram 3800 / Discord 1900）
+- `gracefulShutdown` 會一併關閉 Discord client
 
 ### v5.3.0（2026-04-23）
 
