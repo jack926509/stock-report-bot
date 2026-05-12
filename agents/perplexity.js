@@ -29,17 +29,17 @@ async function perplexitySearch(content, recency = 'day', maxTokens = 1000) {
   }
 }
 
-async function fetchMacroContext() {
+async function fetchMacroContext(sessionLabel = '最近一個交易日') {
   return perplexitySearch(
-    '今天（美東時間）有哪些重大宏觀事件影響美股？請條列 3-5 項，包含：Fed 官員言論、重要經濟數據公布（CPI/PPI/PCE/就業/GDP）、財報季動態、地緣政治事件。每項附來源媒體名稱。',
-    'day', 800
+    `${sessionLabel}（美東時間）這個美股交易日有哪些重大宏觀事件影響美股？請條列 3-5 項，包含：Fed 官員言論、重要經濟數據公布（CPI/PPI/PCE/就業/GDP）、財報季動態、地緣政治事件。每項附來源媒體名稱與日期。`,
+    'week', 800
   );
 }
 
-async function fetchStockCatalyst(symbol, name) {
+async function fetchStockCatalyst(symbol, name, sessionLabel = '最近一個交易日') {
   return perplexitySearch(
-    `${name}（${symbol}）今天股價大幅異動的原因是什麼？列出 1-3 個主要催化劑（財報/升降評/產品消息/法規/並購），每項一句話，附來源媒體名稱。`,
-    'day', 500
+    `${name}（${symbol}）在 ${sessionLabel} 這個美股交易日股價大幅異動的原因是什麼？列出 1-3 個主要催化劑（財報/升降評/產品消息/法規/並購），每項一句話，附來源媒體名稱。`,
+    'week', 500
   );
 }
 

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報 + 新聞快訊 機器人 v5.4（Telegram / Discord）
+// 美股日報 + 新聞快訊 機器人 v5.5（Telegram / Discord）
 //
 // ─── 雙通報架構 ─────────────────────────────────────────
 //  📊 訊息一：美股日報（07:30，週一至週五）
@@ -54,10 +54,21 @@
 //  ✅ ! 前綴指令改為可選（DISCORD_ENABLE_PREFIX_COMMANDS），純斜線指令免開 MESSAGE CONTENT INTENT
 //  ✅ 產業個股改為分組並行抓取（縮短日報資料抓取時間）
 //  ✅ 版本字串統一為 APP_VERSION 常數
+//
+// ─── v5.5 改善（對齊「彙整前一交易日」的目標）────────────
+//  ✅ 報告對象固定為「最近一個已收盤的美股交易日」（以美東時間計算，跳週末＋假日）
+//     — 修正：UTC 伺服器上週一報告被誤跳、週五盤面從不被彙整的問題
+//  ✅ 新聞抓取視窗 / GPT prompt / 報告標題全部對齊該交易日（不再是 UTC 昨天-今天）
+//  ✅ Finnhub 個股新聞改用真實 datetime；Yahoo 新聞依交易日過濾
+//  ✅ 報告 footer 揭露報價覆蓋率；盤中手動觸發加警告
+//  ✅ 同一交易日重複觸發自動去重（手動 /stock 與 RUN_NOW 不受限）
+//  ✅ 新增本地狀態檔與每日快照（STATE_DIR，預設 ./data）
 // ═══════════════════════════════════════════════════════════
 
 'use strict';
 
+const fs           = require('fs');
+const path         = require('path');
 const OpenAI       = require('openai');
 const cron         = require('node-cron');
 const https        = require('https');
@@ -105,7 +116,7 @@ const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID || null; // 設定後斜線指令即時生效（建議單伺服器使用）
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || null;
 const TIMEZONE    = 'Asia/Taipei';
-const APP_VERSION = 'v5.4';
+const APP_VERSION = 'v5.5';
 
 // Discord：是否啟用 ! 前綴訊息指令（需開 MESSAGE CONTENT INTENT）；純斜線指令可設為 false
 const DISCORD_ENABLE_PREFIX_COMMANDS = process.env.DISCORD_ENABLE_PREFIX_COMMANDS !== 'false';
@@ -289,32 +300,33 @@ function finnhubGet(apiPath) {
 // ─────────────────────────────────────────────
 // Finnhub 新聞
 // ─────────────────────────────────────────────
-async function fetchFinnhubNews() {
+// fromYmd / toYmd 為美東日期字串；額外做一次 datetime 客端過濾（Finnhub general news 不一定理會 from/to）
+async function fetchFinnhubNews(fromYmd, toYmd) {
   if (!FINNHUB_KEY) return [];
-  const now       = new Date();
-  const today     = now.toISOString().split('T')[0];
-  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
-  const articles  = await finnhubGet(`/api/v1/news?category=general&from=${yesterday}&to=${today}`);
+  const articles = await finnhubGet(`/api/v1/news?category=general&from=${fromYmd}&to=${toYmd}`);
   if (!Array.isArray(articles)) return [];
+  const cutoffMs = Date.parse(`${fromYmd}T00:00:00-05:00`); // 約略以 EST 為界
   const headlines = articles
     .filter(a => a.headline && a.headline.length > 10)
+    .filter(a => !a.datetime || a.datetime * 1000 >= cutoffMs)
     .slice(0, NEWS_MARKET_LIMIT)
     .map(a => `• ${a.headline}`);
-  log('FINNHUB', `取得 ${headlines.length} 條市場新聞`);
+  log('FINNHUB', `取得 ${headlines.length} 條市場新聞（${fromYmd}~${toYmd}）`);
   return headlines;
 }
 
-async function fetchStockNews(symbol) {
+// 回傳 [{ headline, datetime }]（datetime 為 Unix 秒）
+async function fetchStockNews(symbol, fromYmd, toYmd) {
   if (!FINNHUB_KEY) return [];
-  const now       = new Date();
-  const today     = now.toISOString().split('T')[0];
-  const yesterday = new Date(now - 86400000).toISOString().split('T')[0];
-  const articles  = await finnhubGet(`/api/v1/company-news?symbol=${symbol}&from=${yesterday}&to=${today}`);
+  const articles = await finnhubGet(`/api/v1/company-news?symbol=${symbol}&from=${fromYmd}&to=${toYmd}`);
   if (!Array.isArray(articles)) return [];
-  return articles.slice(0, NEWS_STOCK_LIMIT).map(a => a.headline).filter(Boolean);
+  return articles
+    .filter(a => a.headline)
+    .slice(0, NEWS_STOCK_LIMIT)
+    .map(a => ({ headline: a.headline, datetime: a.datetime || null }));
 }
 
-async function fetchKeyStockNews(marketData) {
+async function fetchKeyStockNews(marketData, fromYmd, toYmd) {
   if (!FINNHUB_KEY) return {};
   const allSectorStocks = Object.values(marketData.sectorStocks).flat();
   const sorted = [...allSectorStocks]
@@ -327,7 +339,7 @@ async function fetchKeyStockNews(marketData) {
   const targetList = [...targets.entries()];
   const results = await batchParallel(
     targetList,
-    async ([symbol]) => ({ symbol, headlines: await fetchStockNews(symbol) }),
+    async ([symbol]) => ({ symbol, headlines: (await fetchStockNews(symbol, fromYmd, toYmd)).map(a => a.headline) }),
     5, 300
   );
   const newsMap = {};
@@ -538,9 +550,10 @@ function fmtBreadthSection(breadth) {
 // ─────────────────────────────────────────────
 function fmtDateHeader() {
   const now     = new Date();
-  const dateStr = now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
-  const weekday = now.toLocaleDateString('zh-TW', { weekday: 'long' });
-  const timeStr = now.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  const opts    = { timeZone: TIMEZONE };
+  const dateStr = now.toLocaleDateString('zh-TW', { ...opts, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const weekday = now.toLocaleDateString('zh-TW', { ...opts, weekday: 'long' });
+  const timeStr = now.toLocaleTimeString('zh-TW', { ...opts, hour: '2-digit', minute: '2-digit' });
   return { dateStr, weekday, timeStr };
 }
 function fmt(num, digits = 2) {
@@ -735,16 +748,13 @@ function buildMarketDataSection(marketData) {
 // ─────────────────────────────────────────────
 // GPT-4o 股市報告 Prompt
 // ─────────────────────────────────────────────
-function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, breadth = null, agentSection = '', macroContext = '', catalystMap = {}) {
-  const today = new Date().toLocaleDateString('zh-TW', {
-    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
-  });
+function buildStockPrompt(marketData, newsHeadlines, stockNewsMap = {}, breadth = null, agentSection = '', macroContext = '', catalystMap = {}, sessionLabel = '最近交易日') {
   const dataSection = buildMarketDataSection(marketData);
   const newsSection = newsHeadlines.length > 0
-    ? `=== 今日財經新聞標題（昨日真實頭條）===\n${newsHeadlines.join('\n')}`
-    : `=== 今日財經新聞 ===\n（新聞資料未取得，宏觀背景請只描述市場氛圍，不引用具體數字）`;
+    ? `=== 該交易日財經新聞頭條（真實標題）===\n${newsHeadlines.join('\n')}`
+    : `=== 財經新聞 ===\n（新聞資料未取得，宏觀背景請只描述市場氛圍，不引用具體數字）`;
   const macroSection = macroContext
-    ? `\n=== 今日宏觀即時資訊（Perplexity 即時搜尋）===\n${macroContext}\n`
+    ? `\n=== 該交易日宏觀即時資訊（Perplexity 即時搜尋）===\n${macroContext}\n`
     : '';
   let stockNewsSection = '';
   if (Object.keys(stockNewsMap).length > 0 || Object.keys(catalystMap).length > 0) {
@@ -774,7 +784,7 @@ ${breadth.sortedSectors.map(([name, p]) => `  ${name}: ${p.avg >= 0 ? '+' : ''}$
 `;
   }
 
-  return `你是專業的美股市場分析師。以下是今天（${today}）的真實市場數據，請撰寫完整美股市場日報。
+  return `你是專業的美股市場分析師。以下是「${sessionLabel}」這個美股交易日的真實收盤數據，請撰寫該交易日的完整美股市場日報（用語以「該交易日／當日」描述，不要寫成「今天」）。
 
 ${dataSection}
 
@@ -914,68 +924,163 @@ function getUSMarketHolidays(year) {
   return result;
 }
 
-function isTradingDay() {
-  const now  = new Date();
-  const day  = now.getDay();
-  if (day === 0 || day === 6) { log('STOCK', '週末，跳過'); return false; }
-  const todayStr = now.toISOString().split('T')[0];
-  const holidays = getUSMarketHolidays(now.getFullYear());
-  if (holidays.includes(todayStr)) {
-    log('STOCK', `美股休市日（${todayStr}），跳過`);
-    return false;
-  }
-  return true;
+// ── 美東時間工具：報告永遠以「最近一個已收盤的美股交易日」為對象 ──
+const US_MARKET_CLOSE_HOUR = 16; // 16:00 ET 收盤（不處理早收盤等細節）
+const ZH_WEEKDAYS = ['週日', '週一', '週二', '週三', '週四', '週五', '週六'];
+
+// 取得指定時間在美東時區的零件
+function nyParts(date = new Date()) {
+  const f = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', hour12: false, weekday: 'short',
+  });
+  const p = Object.fromEntries(f.formatToParts(date).map(x => [x.type, x.value]));
+  const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    y: +p.year, m: +p.month, d: +p.day,
+    hour: (+p.hour) % 24,
+    ymd: `${p.year}-${p.month}-${p.day}`,
+    dow: dowMap[p.weekday],
+  };
+}
+
+function ymdInfo(ymd) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12));
+  return { y, dow: dt.getUTCDay(), isHoliday: getUSMarketHolidays(y).includes(ymd) };
+}
+function shiftYmd(ymd, days) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().split('T')[0];
+}
+function isUSTradingDay(ymd) {
+  const { dow, isHoliday } = ymdInfo(ymd);
+  return dow !== 0 && dow !== 6 && !isHoliday;
+}
+
+// 最近一個已收盤的美股交易日（美東日期字串 YYYY-MM-DD）
+function lastUSTradingSession(now = new Date()) {
+  const ny = nyParts(now);
+  let ymd = ny.ymd;
+  if (ny.hour < US_MARKET_CLOSE_HOUR) ymd = shiftYmd(ymd, -1);
+  while (!isUSTradingDay(ymd)) ymd = shiftYmd(ymd, -1);
+  return ymd;
+}
+// 今天的美東日期（用作新聞抓取視窗的上界）
+function todayET(now = new Date()) { return nyParts(now).ymd; }
+
+// 是否正逢美股盤中（約略 9:30–16:00 ET；用於手動觸發時提醒）
+function isUSMarketOpenNow(now = new Date()) {
+  const ny = nyParts(now);
+  if (ny.dow === 0 || ny.dow === 6) return false;
+  if (getUSMarketHolidays(ny.y).includes(ny.ymd)) return false;
+  return ny.hour >= 9 && ny.hour < 16;
+}
+
+// 把交易日字串格式化成標題用的 { ymd, dateStr, weekday }
+function fmtSessionDate(ymd) {
+  const { dow } = ymdInfo(ymd);
+  const [, m, d] = ymd.split('-').map(Number);
+  return { ymd, dateStr: `${m}/${d}`, weekday: ZH_WEEKDAYS[dow] };
+}
+
+// ─────────────────────────────────────────────
+// 執行狀態 / 每日快照（本地檔案；檔案系統唯讀時自動略過）
+// ─────────────────────────────────────────────
+const DATA_DIR   = process.env.STATE_DIR || './data';
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
+let _state = { lastStockSession: null, lastFlashSession: null };
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      _state = { ..._state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+      log('STATE', `已載入：stock=${_state.lastStockSession || '-'} / flash=${_state.lastFlashSession || '-'}`);
+    }
+  } catch (e) { log('STATE', `載入狀態失敗（忽略）：${e.message}`); }
+}
+function saveState() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(_state, null, 2));
+  } catch (e) { log('STATE', `寫入狀態失敗（忽略）：${e.message}`); }
+}
+function saveReportSnapshot(kind, sessionDate, payload) {
+  try {
+    const dir = path.join(DATA_DIR, 'reports');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, `${sessionDate}-${kind}.json`),
+      JSON.stringify({ kind, sessionDate, generatedAt: new Date().toISOString(), ...payload }, null, 2)
+    );
+    log('STATE', `已存快照 reports/${sessionDate}-${kind}.json`);
+  } catch (e) { log('STATE', `寫入快照失敗（忽略）：${e.message}`); }
 }
 
 // ─────────────────────────────────────────────
 // 執行股市報告
 // ─────────────────────────────────────────────
-async function runStockReport() {
-  if (!isTradingDay()) return;
+async function runStockReport(force = false) {
+  const sessionDate = lastUSTradingSession();
+  const sess        = fmtSessionDate(sessionDate);
+  const sessionLabel = `${sess.dateStr}（${sess.weekday}）`;
+
+  if (!force && _state.lastStockSession === sessionDate) {
+    log('STOCK', `本期（${sessionDate}）已產出過，跳過`);
+    return;
+  }
   if (runningLocks.stock) { log('STOCK', '⚠️ 美股日報正在執行中，跳過重複觸發'); return; }
   runningLocks.stock = true;
   const lockTimer = setTimeout(() => { runningLocks.stock = false; log('STOCK', '⚠️ 執行逾時，強制釋放鎖'); }, LOCK_TIMEOUT_MS);
   const startTime = Date.now();
-  log('STOCK', '🚀 開始執行美股日報');
+  log('STOCK', `🚀 開始執行美股日報（交易日 ${sessionDate}）`);
 
   try {
+    const newsTo        = todayET(); // 新聞視窗上界 = 美東今天（含當交易日後的隔日反應）
     const hasPerplexity = !!(process.env.PERPLEXITY_API_KEY && process.env.DISABLE_PERPLEXITY !== 'true');
 
     // 宏觀搜尋：失敗時重試一次
     const macroFetch = hasPerplexity
       ? (async () => {
-          try { return await fetchMacroContext(); } catch (e1) {
+          try { return await fetchMacroContext(sessionLabel); } catch (e1) {
             await sleep(2000);
-            return fetchMacroContext().catch(e2 => { log('STOCK', `宏觀搜尋失敗，略過：${e2.message}`); return null; });
+            return fetchMacroContext(sessionLabel).catch(e2 => { log('STOCK', `宏觀搜尋失敗，略過：${e2.message}`); return null; });
           }
         })()
       : Promise.resolve(null);
 
     const [marketData, newsHeadlines, macroResult] = await Promise.all([
       fetchAllMarketData(),
-      fetchFinnhubNews(),
+      fetchFinnhubNews(sessionDate, newsTo),
       macroFetch,
     ]);
 
+    const expectedCount = INDICES.length + MAG7.length +
+      Object.values(SECTOR_STOCKS).reduce((a, b) => a + b.length, 0);
     const totalFetched = marketData.indices.length + marketData.mag7.length +
       Object.values(marketData.sectorStocks).reduce((a, b) => a + b.length, 0);
+    const coveragePct = expectedCount > 0 ? Math.round(totalFetched / expectedCount * 100) : 0;
 
     if (totalFetched === 0) {
       log('STOCK', '❌ 所有數據源均失敗');
-      await sendMessage(`<b>⚠️ 美股日報無法生成</b>\n\n原因：所有股價數據源均無回應\n時間：${new Date().toLocaleString('zh-TW')}`);
+      await sendMessage(`<b>⚠️ 美股日報無法生成</b>（交易日 ${sessionDate}）\n\n原因：所有股價數據源均無回應\n時間：${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`);
       return;
     }
+    if (coveragePct < 50) log('STOCK', `⚠️ 報價覆蓋率偏低：${totalFetched}/${expectedCount}（${coveragePct}%）`);
 
     const macroContext = macroResult?.text || '';
     if (macroContext) log('STOCK', '✅ 宏觀即時資訊取得');
 
     log('STOCK', '抓取重點個股新聞...');
-    const stockNewsMap = await fetchKeyStockNews(marketData);
+    const stockNewsMap = await fetchKeyStockNews(marketData, sessionDate, newsTo);
 
     const breadth         = buildMarketBreadth(marketData);
     const breadthSection  = fmtBreadthSection(breadth);
 
-    // Perplexity 催化劑：漲跌幅 >3% 且 Finnhub 沒有已取得新聞的個股
+    // Perplexity 催化劑：該交易日漲跌幅 ≥3% 且 Finnhub 沒有已取得新聞的個股
     const catalystMap = {};
     if (hasPerplexity) {
       const allStocks = [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()];
@@ -990,7 +1095,7 @@ async function runStockReport() {
         log('STOCK', `搜尋 ${bigMovers.length} 支異動股催化劑...`);
         await Promise.all(bigMovers.map(async s => {
           try {
-            const r = await fetchStockCatalyst(s.symbol, s.name);
+            const r = await fetchStockCatalyst(s.symbol, s.name, sessionLabel);
             if (r?.text) catalystMap[s.symbol] = r.text;
           } catch { /* 單支失敗不影響整體 */ }
         }));
@@ -1015,11 +1120,11 @@ async function runStockReport() {
     }
 
     log('STOCK', '呼叫 GPT-4o...');
-    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, breadth, agentSection, macroContext, catalystMap);
+    const prompt = buildStockPrompt(marketData, newsHeadlines, stockNewsMap, breadth, agentSection, macroContext, catalystMap, sessionLabel);
     const report = await callOpenAI(prompt, 'gpt-4o', 4500);
     log('STOCK', `GPT 完成（${report.length} 字）`);
 
-    const { dateStr, weekday, timeStr } = fmtDateHeader();
+    const { timeStr } = fmtDateHeader();
     const spx     = marketData.indices.find(x => x.symbol === '^GSPC');
     const vix     = marketData.indices.find(x => x.symbol === '^VIX');
     const dji     = marketData.indices.find(x => x.symbol === '^DJI');
@@ -1032,15 +1137,20 @@ async function runStockReport() {
     if (ixic?.quote?.changePct != null) quickParts.push(`那指 ${ixic.quote.changePct >= 0 ? '▲' : '▼'}${Math.abs(ixic.quote.changePct).toFixed(2)}%`);
     if (vix?.quote?.price) quickParts.push(`VIX ${fmt(vix.quote.price)}`);
 
-    const header = `<b>📈 美股日報</b>｜${dateStr} ${weekday}\n` +
+    const intradayNote = isUSMarketOpenNow()
+      ? `<i>⚠️ 美股盤中觸發，以下為前一交易日 ${sessionLabel} 收盤資料</i>\n`
+      : '';
+    const header = `<b>📈 美股日報</b>｜${sess.dateStr}（${sess.weekday}）收盤\n` +
+      intradayNote +
       `<code>${quickParts.join('  ')}</code>\n` +
       `${'━'.repeat(24)}\n\n`;
     const sources = ['GPT-4o', 'Yahoo Finance'];
     if (FINNHUB_KEY) sources.push('Finnhub');
     if (macroContext) sources.push('Perplexity');
+    const coverageStr = `${coveragePct < 50 ? '⚠️ ' : ''}報價覆蓋 ${totalFetched}/${expectedCount}（${coveragePct}%）`;
     const footer = `\n\n${'━'.repeat(24)}\n` +
-      `<i>🤖 ${sources.join(' · ')}</i>\n` +
-      `<i>⏱ ${timeStr} 發布 · 僅供參考，不構成投資建議</i>`;
+      `<i>🤖 ${sources.join(' · ')}｜${coverageStr}</i>\n` +
+      `<i>⏱ ${timeStr}（台北）發布 · 資料為 ${sessionLabel} 美股收盤 · 僅供參考，不構成投資建議</i>`;
     const programSection = '\n\n' + breadthSection + '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
     const fullReport = header + report + programSection + footer;
 
@@ -1056,10 +1166,23 @@ async function runStockReport() {
       await sendMessage(msg);
       if (i < chunks.length - 1) await sleep(1500);
     }
+
+    // 持久化：記錄已產出 + 存當日快照（檔案系統唯讀時自動略過）
+    _state.lastStockSession = sessionDate;
+    saveState();
+    saveReportSnapshot('stock', sessionDate, {
+      coverage: { fetched: totalFetched, expected: expectedCount, pct: coveragePct },
+      indices: marketData.indices.map(s => ({ symbol: s.symbol, name: s.name, price: s.quote?.price ?? null, changePct: s.quote?.changePct ?? null })),
+      breadth: { ...breadth, highVolume: breadth.highVolume.map(s => s.symbol) },
+      quotes: [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()]
+        .map(s => ({ symbol: s.symbol, name: s.name, price: s.quote?.price ?? null, changePct: s.quote?.changePct ?? null })),
+      gptReport: report,
+    });
+
     log('STOCK', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('STOCK', `❌ 失敗：${err.message}`);
-    await sendMessage(`<b>❌ 美股日報執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
+    await sendMessage(`<b>❌ 美股日報執行失敗</b>（交易日 ${sessionDate}）\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`).catch(() => {});
   } finally {
     clearTimeout(lockTimer);
     runningLocks.stock = false;
@@ -1081,13 +1204,13 @@ async function runStockReport() {
 // Yahoo Finance 個股新聞抓取
 // 使用 yahooFinance.search() 的 news 結果
 // ─────────────────────────────────────────────
-async function fetchYahooStockNews(symbol, maxItems = 5) {
+async function fetchYahooStockNews(symbol, sessionYmd, maxItems = 5) {
   try {
-    const result = await yahooFinance.search(symbol, { newsCount: maxItems }, { validateResult: false });
-    const now    = new Date();
-    const cutoff = new Date(now - 48 * 3600 * 1000); // 48小時內（美股昨日盤面）
+    const result = await yahooFinance.search(symbol, { newsCount: Math.max(maxItems, 8) }, { validateResult: false });
+    // 只保留「被報告的交易日」當天 00:00 ET 起的新聞
+    const cutoffMs = Date.parse(`${sessionYmd}T00:00:00-05:00`);
     return (result?.news || [])
-      .filter(n => n.title && new Date(n.providerPublishTime * 1000) > cutoff)
+      .filter(n => n.title && n.providerPublishTime * 1000 >= cutoffMs)
       .slice(0, maxItems)
       .map(n => ({
         title:    n.title,
@@ -1104,11 +1227,11 @@ async function fetchYahooStockNews(symbol, maxItems = 5) {
 // 來源：Finnhub 市場新聞 + Finnhub/Yahoo 個股新聞
 // 對象：MAG7 + 所有池內個股（80支）
 // ─────────────────────────────────────────────
-async function collectFlashNews() {
-  log('FLASH', '開始收集快訊新聞原料...');
+async function collectFlashNews(sessionYmd, toYmd) {
+  log('FLASH', `開始收集快訊新聞原料（交易日 ${sessionYmd}）...`);
 
-  // 1. Finnhub 市場大盤新聞（昨日）
-  const marketNews = await fetchFinnhubNews();
+  // 1. Finnhub 市場大盤新聞（被報告的交易日起）
+  const marketNews = await fetchFinnhubNews(sessionYmd, toYmd);
   log('FLASH', `Finnhub 市場新聞：${marketNews.length} 條`);
 
   // 2. 收集所有目標個股清單（MAG7 + 8 大產業池，去重）
@@ -1121,15 +1244,17 @@ async function collectFlashNews() {
   // 3. 個股新聞：Finnhub 優先，失敗或空則補 Yahoo Finance（批次並行）
   const symbolList = [...allSymbols.entries()];
   const batchResults = await batchParallel(symbolList, async ([symbol, name]) => {
-    // Finnhub 個股新聞
     if (FINNHUB_KEY) {
-      const headlines = await fetchStockNews(symbol);
-      if (headlines.length > 0) {
-        return headlines.map(title => ({ title, link: '', source: 'Finnhub', symbol, name, pubTime: Date.now() }));
+      const arts = await fetchStockNews(symbol, sessionYmd, toYmd);
+      if (arts.length > 0) {
+        return arts.map(a => ({
+          title: a.headline, link: '', source: 'Finnhub', symbol, name,
+          pubTime: a.datetime ? a.datetime * 1000 : null,
+        }));
       }
     }
     // 備援：Yahoo Finance 個股新聞
-    const yahooNews = await fetchYahooStockNews(symbol, 3);
+    const yahooNews = await fetchYahooStockNews(symbol, sessionYmd, 3);
     return yahooNews.map(n => ({ ...n, name }));
   }, 5, 300);
 
@@ -1142,10 +1267,10 @@ async function collectFlashNews() {
 // GPT-4o-mini 分析快訊：評分 + 分類
 // 只回傳評分 ≥ 4 的新聞
 // ─────────────────────────────────────────────
-async function analyzeFlashNews(marketNews, stockArticles) {
+async function analyzeFlashNews(marketNews, stockArticles, sessionLabel = '最近交易日') {
   // 市場新聞處理（直接用 GPT 篩選重要條目）
   const marketPrompt = marketNews.length > 0
-    ? `以下是昨日美股市場新聞標題，請篩選出最重要的 3~5 條並回傳 JSON。
+    ? `以下是${sessionLabel}美股市場新聞標題，請篩選出最重要的 3~5 條並回傳 JSON。
 評分：5=Fed/CPI/重大地緣/系統性風險，4=重要總經事件，3以下忽略。
 回傳純 JSON（不要其他文字）：
 {"items":[{"title":"原始標題","summary_zh":"繁中摘要20字內","importance":5,"category":"Fed政策|通膨|地緣|財報|市場結構"}]}
@@ -1171,7 +1296,7 @@ ${marketNews.slice(0, 30).join('\n')}`
     `[${i + 1}] ${a.name}(${a.symbol}): ${a.title}`
   ).join('\n');
 
-  const stockPrompt = `以下是昨日美股個股新聞，請評分並篩選重要條目回傳 JSON。
+  const stockPrompt = `以下是${sessionLabel}美股個股新聞，請評分並篩選重要條目回傳 JSON。
 評分：5=重大財報/產品發布/CEO異動/重大訴訟，4=業績預警/升降評/併購，3以下忽略。
 只回傳評分 ≥ 4 的條目，最多 10 條。
 回傳純 JSON（不要其他文字）：
@@ -1201,11 +1326,14 @@ ${stockText}`;
 // ─────────────────────────────────────────────
 // 組合快訊 Telegram 訊息
 // ─────────────────────────────────────────────
-function buildFlashMessage(analyzed, indexSnapshot = []) {
-  const { dateStr, weekday, timeStr } = fmtDateHeader();
+function buildFlashMessage(analyzed, indexSnapshot = [], sessionDate = null) {
+  const { timeStr } = fmtDateHeader();
+  const sess = sessionDate ? fmtSessionDate(sessionDate) : null;
 
   const totalCount = analyzed.market.length + analyzed.stocks.length;
-  let msg = `<b>⚡ 美股新聞快訊</b>｜${dateStr} ${weekday}\n`;
+  let msg = sess
+    ? `<b>⚡ 美股新聞快訊</b>｜${sess.dateStr}（${sess.weekday}）盤後\n`
+    : `<b>⚡ 美股新聞快訊</b>\n`;
   msg += `${'━'.repeat(24)}\n`;
 
   // ── 指數快照 ──
@@ -1227,7 +1355,7 @@ function buildFlashMessage(analyzed, indexSnapshot = []) {
       msg += '\n';
     }
   } else {
-    msg += `  <i>昨日無重大總經或地緣事件</i>\n`;
+    msg += `  <i>該交易日無重大總經或地緣事件</i>\n`;
   }
 
   // ── 個股快訊 ──
@@ -1241,11 +1369,11 @@ function buildFlashMessage(analyzed, indexSnapshot = []) {
       msg += `\n   ${item.summary_zh}\n`;
     }
   } else {
-    msg += `  <i>昨日池內個股無重大事件</i>\n`;
+    msg += `  <i>該交易日池內個股無重大事件</i>\n`;
   }
 
   msg += `\n${'━'.repeat(24)}\n`;
-  msg += `<i>⚡ ${totalCount} 則重要新聞 · ${timeStr} 發布</i>\n`;
+  msg += `<i>⚡ ${totalCount} 則重要新聞 · ${timeStr}（台北）發布</i>\n`;
   msg += `<i>來源：Finnhub / Yahoo Finance · 僅供參考</i>`;
   return msg;
 }
@@ -1253,18 +1381,26 @@ function buildFlashMessage(analyzed, indexSnapshot = []) {
 // ─────────────────────────────────────────────
 // 執行快訊報告
 // ─────────────────────────────────────────────
-async function runFlashReport() {
-  if (!isTradingDay()) return;
+async function runFlashReport(force = false) {
+  const sessionDate  = lastUSTradingSession();
+  const sess         = fmtSessionDate(sessionDate);
+  const sessionLabel = `${sess.dateStr}（${sess.weekday}）`;
+
+  if (!force && _state.lastFlashSession === sessionDate) {
+    log('FLASH', `本期（${sessionDate}）已產出過，跳過`);
+    return;
+  }
   if (runningLocks.flash) { log('FLASH', '⚠️ 美股新聞快訊正在執行中，跳過重複觸發'); return; }
   runningLocks.flash = true;
   const lockTimerFlash = setTimeout(() => { runningLocks.flash = false; log('FLASH', '⚠️ 執行逾時，強制釋放鎖'); }, LOCK_TIMEOUT_MS);
   const startTime = Date.now();
-  log('FLASH', '🚀 開始執行美股新聞快訊');
+  log('FLASH', `🚀 開始執行美股新聞快訊（交易日 ${sessionDate}）`);
 
   try {
+    const newsTo = todayET();
     // 同時抓取新聞和指數快照
     const [{ marketNews, stockArticles }, indexQuotes] = await Promise.all([
-      collectFlashNews(),
+      collectFlashNews(sessionDate, newsTo),
       Promise.all(INDICES.map(s => fetchQuote(s.symbol))),
     ]);
 
@@ -1273,28 +1409,36 @@ async function runFlashReport() {
       return;
     }
 
-    log('FLASH', '分析新聯重要性...');
-    const analyzed = await analyzeFlashNews(marketNews, stockArticles);
+    log('FLASH', '分析新聞重要性...');
+    const analyzed = await analyzeFlashNews(marketNews, stockArticles, sessionLabel);
 
     // 若大盤和個股都沒有高分新聞，靜默跳過（不發空訊息）
     if (analyzed.market.length === 0 && analyzed.stocks.length === 0) {
-      log('FLASH', '無高重要性新聞（≥4分），今日跳過推播');
+      log('FLASH', '無高重要性新聞（≥4分），跳過推播');
       return;
     }
 
     // 附加指數快照
     const indexSnapshot = INDICES.map((s, i) => ({ ...s, quote: indexQuotes[i] })).filter(x => x.quote);
-    const message = buildFlashMessage(analyzed, indexSnapshot);
+    const message = buildFlashMessage(analyzed, indexSnapshot, sessionDate);
     const chunks  = splitMessage(message, MSG_LIMIT);
     for (let i = 0; i < chunks.length; i++) {
       await sendMessage(chunks[i]);
       if (i < chunks.length - 1) await sleep(1000);
     }
 
+    _state.lastFlashSession = sessionDate;
+    saveState();
+    saveReportSnapshot('flash', sessionDate, {
+      indexSnapshot: indexSnapshot.map(s => ({ symbol: s.symbol, name: s.name, price: s.quote?.price ?? null, changePct: s.quote?.changePct ?? null })),
+      market: analyzed.market,
+      stocks: analyzed.stocks,
+    });
+
     log('FLASH', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('FLASH', `❌ 失敗：${err.message}`);
-    await sendMessage(`<b>❌ 美股新聞快訊執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
+    await sendMessage(`<b>❌ 美股新聞快訊執行失敗</b>（交易日 ${sessionDate}）\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`).catch(() => {});
   } finally {
     clearTimeout(lockTimerFlash);
     runningLocks.flash = false;
@@ -1461,10 +1605,10 @@ async function initDiscord() {
         await interaction.reply(htmlToDiscord(buildPingMessage()).slice(0, 2000));
       } else if (interaction.commandName === 'stock') {
         await interaction.reply('⏳ **美股日報**生成中，請稍候...');
-        runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+        runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
       } else if (interaction.commandName === 'flash') {
         await interaction.reply('⏳ **美股新聞快訊**生成中，請稍候...');
-        runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+        runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
       }
     } catch (e) { log('DISCORD', `斜線指令處理錯誤: ${e.message}`); }
   });
@@ -1480,10 +1624,10 @@ async function initDiscord() {
           await sendMessage(buildPingMessage());
         } else if (cmd === '!stock') {
           await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
-          runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+          runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
         } else if (cmd === '!flash') {
           await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
-          runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+          runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
         }
       } catch (e) { log('DISCORD', `指令處理錯誤: ${e.message}`); }
     });
@@ -1570,10 +1714,10 @@ async function startPolling() {
           await sendMessage(buildPingMessage());
         } else if (text === '/stock') {
           await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
-          runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+          runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
         } else if (text === '/flash') {
           await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
-          runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+          runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
         }
       }
     } catch (e) { log('POLL', `polling 錯誤: ${e.message}`); }
@@ -1654,6 +1798,8 @@ process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 // ═══════════════════════════════════════════════════════════
 async function main() {
   log('MAIN', `🚀 美股日報 Bot ${APP_VERSION} 啟動（訊息平台：${PLATFORM}）`);
+  loadState();
+  log('MAIN', `📅 目前對應的美股交易日：${lastUSTradingSession()}`);
 
   cron.schedule(STOCK_SCHEDULE, () => {
     log('CRON', '⏰ 觸發美股日報排程');
@@ -1699,8 +1845,8 @@ if (process.env.RUN_NOW === 'true') {
   log('MAIN', '⚡ RUN_NOW 測試模式');
   main().then(() => {
     const target = process.env.RUN_NOW_TARGET || 'stock';
-    if (target === 'flash') runFlashReport();
-    else                    runStockReport();
+    if (target === 'flash') runFlashReport(true);
+    else                    runStockReport(true);
   });
 } else {
   main().catch(e => { console.error('❌ 主程式崩潰:', e); process.exit(1); });
