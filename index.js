@@ -61,14 +61,26 @@ const { runAgentsForSymbols, formatAgentSignals } = require('./agents/index');
 const { fetchMacroContext, fetchStockCatalyst } = require('./agents/perplexity');
 
 // ─────────────────────────────────────────────
+// 訊息平台選擇（telegram / discord）
+// ─────────────────────────────────────────────
+// 優先看 MESSAGING_PLATFORM；未設定時，若有 DISCORD_BOT_TOKEN 則用 discord，否則 telegram
+const PLATFORM = (process.env.MESSAGING_PLATFORM
+  || (process.env.DISCORD_BOT_TOKEN ? 'discord' : 'telegram')).toLowerCase();
+
+// ─────────────────────────────────────────────
 // 環境變數驗證
 // ─────────────────────────────────────────────
-const REQUIRED_VARS = ['OPENAI_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
-
 function validateEnv() {
-  const missing = REQUIRED_VARS.filter(v => !process.env[v]);
+  const missing = ['OPENAI_API_KEY'].filter(v => !process.env[v]);
+  if (PLATFORM === 'discord') {
+    if (!process.env.DISCORD_BOT_TOKEN)  missing.push('DISCORD_BOT_TOKEN');
+    if (!process.env.DISCORD_CHANNEL_ID) missing.push('DISCORD_CHANNEL_ID');
+  } else {
+    if (!process.env.TELEGRAM_BOT_TOKEN) missing.push('TELEGRAM_BOT_TOKEN');
+    if (!process.env.TELEGRAM_CHAT_ID)   missing.push('TELEGRAM_CHAT_ID');
+  }
   if (missing.length > 0) {
-    console.error(`❌ 缺少必要的環境變數：${missing.join(', ')}`);
+    console.error(`❌ 缺少必要的環境變數（平台：${PLATFORM}）：${missing.join(', ')}`);
     process.exit(1);
   }
   if (!process.env.FINNHUB_API_KEY) {
@@ -81,8 +93,13 @@ validateEnv();
 const OPENAI_KEY  = process.env.OPENAI_API_KEY;
 const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
+const DISCORD_TOKEN      = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const FINNHUB_KEY = process.env.FINNHUB_API_KEY || null;
 const TIMEZONE    = 'Asia/Taipei';
+
+// 各平台單則訊息字數上限（保留安全邊界）：Telegram 4096 / Discord 2000
+const MSG_LIMIT = PLATFORM === 'discord' ? 1900 : 3800;
 
 const STOCK_SCHEDULE = '30 7 * * 1-5';
 const FLASH_SCHEDULE = '35 7 * * 1-5';
@@ -935,7 +952,7 @@ async function runStockReport() {
 
     if (totalFetched === 0) {
       log('STOCK', '❌ 所有數據源均失敗');
-      await sendTelegram(`<b>⚠️ 美股日報無法生成</b>\n\n原因：所有股價數據源均無回應\n時間：${new Date().toLocaleString('zh-TW')}`);
+      await sendMessage(`<b>⚠️ 美股日報無法生成</b>\n\n原因：所有股價數據源均無回應\n時間：${new Date().toLocaleString('zh-TW')}`);
       return;
     }
 
@@ -1017,7 +1034,7 @@ async function runStockReport() {
     const programSection = '\n\n' + breadthSection + '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
     const fullReport = header + report + programSection + footer;
 
-    const chunks = splitMessage(fullReport, 3800);
+    const chunks = splitMessage(fullReport, MSG_LIMIT);
     log('STOCK', `發送 ${chunks.length} 段...`);
     for (let i = 0; i < chunks.length; i++) {
       let msg = chunks[i];
@@ -1026,13 +1043,13 @@ async function runStockReport() {
           ? `\n\n<i>━ ${i + 1}/${chunks.length} ━ 續下則 ▸</i>`
           : `\n\n<i>━ ${i + 1}/${chunks.length} ━ 完 ━</i>`;
       }
-      await sendTelegram(msg);
+      await sendMessage(msg);
       if (i < chunks.length - 1) await sleep(1500);
     }
     log('STOCK', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('STOCK', `❌ 失敗：${err.message}`);
-    await sendTelegram(`<b>❌ 美股日報執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
+    await sendMessage(`<b>❌ 美股日報執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
     clearTimeout(lockTimer);
     runningLocks.stock = false;
@@ -1258,16 +1275,16 @@ async function runFlashReport() {
     // 附加指數快照
     const indexSnapshot = INDICES.map((s, i) => ({ ...s, quote: indexQuotes[i] })).filter(x => x.quote);
     const message = buildFlashMessage(analyzed, indexSnapshot);
-    const chunks  = splitMessage(message, 3800);
+    const chunks  = splitMessage(message, MSG_LIMIT);
     for (let i = 0; i < chunks.length; i++) {
-      await sendTelegram(chunks[i]);
+      await sendMessage(chunks[i]);
       if (i < chunks.length - 1) await sleep(1000);
     }
 
     log('FLASH', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   } catch (err) {
     log('FLASH', `❌ 失敗：${err.message}`);
-    await sendTelegram(`<b>❌ 美股新聞快訊執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
+    await sendMessage(`<b>❌ 美股新聞快訊執行失敗</b>\n\n<code>${err.message}</code>\n${new Date().toLocaleString('zh-TW')}`).catch(() => {});
   } finally {
     clearTimeout(lockTimerFlash);
     runningLocks.flash = false;
@@ -1305,29 +1322,29 @@ async function callOpenAI(prompt, model = 'gpt-4o', maxTokens = 2000, retries = 
   }
 }
 
-async function sendTelegram(text, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await sendRawTelegram(text, 'HTML');
-    } catch (err) {
-      // HTML 解析失敗 → 降級純文字（不重試）
-      if (err.message.includes("can't parse") || err.message.includes('Bad Request')) {
-        log('TG', '⚠️ HTML 失敗，降級純文字');
-        return await sendRawTelegram(text.replace(/<[^>]+>/g, ''), null);
-      }
-      // 網路/限速錯誤 → 指數退避重試
-      if (attempt < retries) {
-        const delay = attempt * 2000;
-        log('TG', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
-        await sleep(delay);
-      } else {
-        log('TG', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
-        throw err;
-      }
-    }
-  }
+// ═══════════════════════════════════════════════════════════
+// 訊息平台抽象層（Telegram / Discord）
+// ═══════════════════════════════════════════════════════════
+// 對外 API：
+//   sendMessage(text)        — 送一則訊息（自動依平台轉換格式並重試）
+//   splitMessage(text, max)  — 把長訊息切成多段（沿用原本 <b> 區段切點）
+// 報告內容統一用「Telegram HTML」撰寫（<b> <i> <code>），Discord 模式會即時轉成 Markdown。
+
+// ── HTML → Discord Markdown ──
+function htmlToDiscord(text) {
+  return text
+    .replace(/<\/?(b|strong)>/g, '**')
+    .replace(/<\/?(i|em)>/g, '*')
+    .replace(/<code>([\s\S]*?)<\/code>/g, '`$1`')
+    .replace(/<pre>([\s\S]*?)<\/pre>/g, '```\n$1\n```')
+    .replace(/<a\s+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g, '[$2]($1)')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }
 
+// ── Telegram ──
 function sendRawTelegram(text, parseMode = 'HTML') {
   return new Promise((resolve, reject) => {
     const payload = { chat_id: CHAT_ID, text };
@@ -1355,7 +1372,101 @@ function sendRawTelegram(text, parseMode = 'HTML') {
   });
 }
 
-function splitMessage(text, maxLen = 3800) {
+async function sendTelegram(text, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await sendRawTelegram(text, 'HTML');
+    } catch (err) {
+      // HTML 解析失敗 → 降級純文字（不重試）
+      if (err.message.includes("can't parse") || err.message.includes('Bad Request')) {
+        log('TG', '⚠️ HTML 失敗，降級純文字');
+        return await sendRawTelegram(text.replace(/<[^>]+>/g, ''), null);
+      }
+      // 網路/限速錯誤 → 指數退避重試
+      if (attempt < retries) {
+        const delay = attempt * 2000;
+        log('TG', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
+        await sleep(delay);
+      } else {
+        log('TG', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
+        throw err;
+      }
+    }
+  }
+}
+
+// ── Discord ──
+let discordClient  = null;
+let discordChannel = null;
+
+async function initDiscord() {
+  const { Client, GatewayIntentBits, Partials } = require('discord.js');
+  discordClient = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.DirectMessages,
+    ],
+    partials: [Partials.Channel],
+  });
+  discordClient.on('error', e => log('DISCORD', `client error: ${e.message}`));
+  discordClient.on('warn',  m => log('DISCORD', `warn: ${m}`));
+
+  await discordClient.login(DISCORD_TOKEN);
+  if (!discordClient.isReady()) {
+    await new Promise(resolve => discordClient.once('ready', resolve));
+  }
+  discordChannel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+  if (!discordChannel || typeof discordChannel.send !== 'function') {
+    throw new Error(`DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID} 不是可發送訊息的文字頻道`);
+  }
+  log('DISCORD', `✅ 已登入 ${discordClient.user.tag}，目標頻道 #${discordChannel.name || DISCORD_CHANNEL_ID}`);
+
+  // 指令監聽（用 ! 前綴；Discord 內建斜線指令需另外註冊，這裡用最簡單的訊息指令）
+  discordClient.on('messageCreate', async (m) => {
+    try {
+      if (m.author?.bot) return;
+      if (String(m.channelId) !== String(DISCORD_CHANNEL_ID)) return;
+      const cmd = m.content.trim().toLowerCase();
+      if (cmd === '!ping') {
+        await sendMessage(buildPingMessage());
+      } else if (cmd === '!stock') {
+        await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
+        runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
+      } else if (cmd === '!flash') {
+        await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
+        runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
+      }
+    } catch (e) { log('DISCORD', `指令處理錯誤: ${e.message}`); }
+  });
+}
+
+async function sendDiscord(text, retries = 3) {
+  const content = htmlToDiscord(text).slice(0, 2000);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      if (!discordChannel) throw new Error('Discord 頻道尚未就緒');
+      return await discordChannel.send({ content, allowedMentions: { parse: [] } });
+    } catch (err) {
+      if (attempt < retries) {
+        const delay = attempt * 2000;
+        log('DISCORD', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
+        await sleep(delay);
+      } else {
+        log('DISCORD', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
+        throw err;
+      }
+    }
+  }
+}
+
+// ── 統一發送入口 ──
+async function sendMessage(text, retries = 3) {
+  return PLATFORM === 'discord' ? sendDiscord(text, retries) : sendTelegram(text, retries);
+}
+
+function splitMessage(text, maxLen = MSG_LIMIT) {
   if (text.length <= maxLen) return [text];
   const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡])/g;
   const sections   = text.split(SECTION_RE);
@@ -1373,8 +1484,25 @@ function splitMessage(text, maxLen = 3800) {
   return chunks;
 }
 
+// ── /ping 訊息（Telegram & Discord 共用）──
+function buildPingMessage() {
+  const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  const uptime = Math.floor(process.uptime());
+  const uptimeStr = uptime >= 3600
+    ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
+    : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
+  return `<b>🟢 系統狀態</b>\n` +
+    `${'━'.repeat(20)}\n` +
+    `  版本　 <code>v5.3</code>\n` +
+    `  平台　 <code>${PLATFORM}</code>\n` +
+    `  狀態　 正常運作中\n` +
+    `  記憶體 <code>${mem} MB</code>\n` +
+    `  運行　 <code>${uptimeStr}</code>\n` +
+    `  時間　 ${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`;
+}
+
 // ─────────────────────────────────────────────
-// Telegram 指令監聽
+// Telegram 指令監聽（polling）
 // ─────────────────────────────────────────────
 async function startPolling() {
   let offset = 0;
@@ -1388,25 +1516,12 @@ async function startPolling() {
         const chatId = String(upd.message?.chat?.id || '');
         if (chatId !== CHAT_ID) continue;
         if (text === '/ping') {
-          const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-          const uptime = Math.floor(process.uptime());
-          const uptimeStr = uptime >= 3600
-            ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
-            : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
-          await sendTelegram(
-            `<b>🟢 系統狀態</b>\n` +
-            `${'━'.repeat(20)}\n` +
-            `  版本　 <code>v5.3</code>\n` +
-            `  狀態　 正常運作中\n` +
-            `  記憶體 <code>${mem} MB</code>\n` +
-            `  運行　 <code>${uptimeStr}</code>\n` +
-            `  時間　 ${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`
-          );
+          await sendMessage(buildPingMessage());
         } else if (text === '/stock') {
-          await sendTelegram('⏳ <b>美股日報</b>生成中，請稍候...');
+          await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
           runStockReport().catch(e => log('STOCK', `手動失敗: ${e.message}`));
         } else if (text === '/flash') {
-          await sendTelegram('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
+          await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
           runFlashReport().catch(e => log('FLASH', `手動失敗: ${e.message}`));
         }
       }
@@ -1475,6 +1590,8 @@ async function gracefulShutdown(signal) {
     await sleep(3000);
   }
 
+  if (discordClient) { try { await discordClient.destroy(); } catch {} }
+
   log('MAIN', '👋 Bot 已關閉');
   process.exit(0);
 }
@@ -1485,7 +1602,7 @@ process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 // 主程式
 // ═══════════════════════════════════════════════════════════
 async function main() {
-  log('MAIN', '🚀 美股日報 Bot v5.3 啟動');
+  log('MAIN', `🚀 美股日報 Bot v5.3 啟動（訊息平台：${PLATFORM}）`);
 
   cron.schedule(STOCK_SCHEDULE, () => {
     log('CRON', '⏰ 觸發美股日報排程');
@@ -1502,18 +1619,24 @@ async function main() {
 
   startWatchdog();
   startHealthServer();
-  startPolling();
 
-  await sendTelegram(
+  if (PLATFORM === 'discord') {
+    await initDiscord();
+  } else {
+    startPolling();
+  }
+
+  const cmdPrefix = PLATFORM === 'discord' ? '!' : '/';
+  await sendMessage(
     `<b>🟢 Bot v5.3 已啟動</b>\n` +
     `${'━'.repeat(20)}\n\n` +
     `<b>📋 每日排程</b>（週一至週五）\n` +
     `  <code>07:30</code>  📈 美股日報\n` +
     `  <code>07:35</code>  ⚡ 美股新聞快訊\n\n` +
     `<b>🎮 指令</b>\n` +
-    `  /ping — 系統狀態\n` +
-    `  /stock — 觸發美股日報\n` +
-    `  /flash — 觸發新聞快訊`
+    `  ${cmdPrefix}ping — 系統狀態\n` +
+    `  ${cmdPrefix}stock — 觸發美股日報\n` +
+    `  ${cmdPrefix}flash — 觸發新聞快訊`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');

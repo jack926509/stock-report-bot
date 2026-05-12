@@ -7,6 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "discord.js": "^14.26.4",
     "node-cron": "^3.0.3",
     "openai": "^4.77.0",
     "yahoo-finance2": "^3.3.0"
