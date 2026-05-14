@@ -69,6 +69,17 @@
 //  ✅ 移除 Telegram / Discord 相關程式碼與依賴
 //  ✅ 報告以 Block Kit 呈現（header + section + divider）
 //  ✅ 斜線指令 /ping /stock /flash 走 Socket Mode（不需公開 URL）
+//
+// ─── v6.1 改善 ──────────────────────────────────────────
+//  ✅ 日報 + 快訊頂部加「💡 一眼看懂」TL;DR：三大指數方向、Top3
+//     漲/跌個股、市場廣度一句結論，滑一眼就掌握當日重點
+//  ✅ 個股快訊加掛當日漲跌幅徽章（🚀/🟢/🔴/💥），看標題立刻
+//     判斷利多/利空
+//  ✅ 新增 /help、/today（snapshot TL;DR）、/last（重貼上次日報）
+//  ✅ 排程改為週一~週六（cron 1-6）：週五美股收盤的報告週六
+//     上午就看得到，不必等到下週一
+//  ✅ emoji 標準化：🟢 漲 / 🔴 跌 / ⚪ 持平 / 🚀 ≥+3% / 💥 ≤-3%
+//     / 🔥 高重要性 / ⚡ 一般快訊
 // ═══════════════════════════════════════════════════════════
 
 'use strict';
@@ -112,14 +123,14 @@ const SLACK_APP_TOKEN   = process.env.SLACK_APP_TOKEN;
 const SLACK_CHANNEL_ID  = process.env.SLACK_CHANNEL_ID;
 const FINNHUB_KEY       = process.env.FINNHUB_API_KEY || null;
 const TIMEZONE          = 'Asia/Taipei';
-const APP_VERSION       = 'v6.0';
+const APP_VERSION       = 'v6.1';
 
 // 切分訊息用的字數上限：Slack 單則 chat.postMessage text 上限約 40000、單一 section block 文字 3000。
 // 為了讓多區段一次成圖（一則訊息一段報告），這裡設高一點，由 Block Kit 內部再分塊處理。
 const MSG_LIMIT = 12000;
 
-const STOCK_SCHEDULE = '30 7 * * 1-5';
-const FLASH_SCHEDULE = '35 7 * * 1-5';
+const STOCK_SCHEDULE = '30 7 * * 1-6';
+const FLASH_SCHEDULE = '35 7 * * 1-6';
 const NEWS_MARKET_LIMIT = 20;
 const NEWS_STOCK_LIMIT  = 3;
 
@@ -570,6 +581,118 @@ function formatVolume(vol) {
   if (vol >= 1e6) return `${(vol / 1e6).toFixed(1)}M`;
   return vol.toLocaleString();
 }
+
+// ─────────────────────────────────────────────
+// 一眼看懂用 helper：個股漲跌幅小徽章
+// 🚀 ≥+3% / 🟢 +0~+3% / ⚪ ≈0 / 🔴 -3~0% / 💥 ≤-3%
+// ─────────────────────────────────────────────
+function changeBadge(pct) {
+  if (pct == null) return '⚪ —';
+  if (pct >= 3)  return `🚀 +${pct.toFixed(2)}%`;
+  if (pct >  0)  return `🟢 +${pct.toFixed(2)}%`;
+  if (pct === 0) return `⚪ 0.00%`;
+  if (pct > -3)  return `🔴 ${pct.toFixed(2)}%`;
+  return `💥 ${pct.toFixed(2)}%`;
+}
+
+// ─────────────────────────────────────────────
+// 日報 TL;DR：三大指數方向 + Top3 漲 / Top3 跌 + 一句總結
+// ─────────────────────────────────────────────
+function buildStockTLDR(marketData, breadth) {
+  const idxOrder  = [['^GSPC', 'S&P'], ['^DJI', '道瓊'], ['^IXIC', '那指']];
+  const idxLine = idxOrder
+    .map(([sym, name]) => {
+      const idx = marketData.indices.find(x => x.symbol === sym);
+      const pct = idx?.quote?.changePct;
+      if (pct == null) return null;
+      const dot = pct > 0.05 ? '🟢' : pct < -0.05 ? '🔴' : '⚪';
+      const sign = pct >= 0 ? '+' : '';
+      return `${dot} <b>${name}</b> <code>${sign}${pct.toFixed(2)}%</code>`;
+    })
+    .filter(Boolean)
+    .join('  ');
+
+  const vix = marketData.indices.find(x => x.symbol === '^VIX');
+  let vixTag = '';
+  if (vix?.quote?.price != null) {
+    const v = vix.quote.price;
+    const flag = v >= 30 ? '🚨' : v >= 25 ? '⚠️' : v >= 20 ? '🟡' : '🟢';
+    vixTag = `  📊 <b>VIX</b> <code>${v.toFixed(1)}</code> ${flag}`;
+  }
+
+  const allStocks = [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()]
+    .filter(s => s.quote?.changePct != null);
+  const sorted = [...allStocks].sort((a, b) => b.quote.changePct - a.quote.changePct);
+  const top3 = sorted.slice(0, 3)
+    .map(s => `<code>${s.symbol}</code> ${changeBadge(s.quote.changePct)}`)
+    .join('　');
+  const bot3 = sorted.slice(-3).reverse()
+    .map(s => `<code>${s.symbol}</code> ${changeBadge(s.quote.changePct)}`)
+    .join('　');
+
+  // 程式化一句話結論：依市場廣度與 VIX
+  const adv = breadth.advancing || 0;
+  const dec = breadth.declining || 0;
+  const ratio = dec > 0 ? adv / dec : (adv > 0 ? Infinity : 1);
+  let mood;
+  if (ratio >= 2)      mood = '🟢 強勢日，多數個股收紅';
+  else if (ratio >= 1.2) mood = '🟢 偏多日，買盤稍占優';
+  else if (ratio <= 0.5) mood = '🔴 弱勢日，多數個股收黑';
+  else if (ratio <= 0.83) mood = '🔴 偏空日，賣壓稍占優';
+  else                  mood = '⚪ 漲跌互現，盤整氣氛';
+  if (vix?.quote?.price >= 30)      mood += '；🚨 恐慌升溫';
+  else if (vix?.quote?.price >= 25) mood += '；⚠️ 恐慌偏高';
+
+  return `<b>💡 一眼看懂</b>\n` +
+    `${idxLine}${vixTag}\n` +
+    `🚀 <b>漲幅 TOP3</b>　${top3 || '<i>無資料</i>'}\n` +
+    `💥 <b>跌幅 TOP3</b>　${bot3 || '<i>無資料</i>'}\n` +
+    `${mood}`;
+}
+
+// ─────────────────────────────────────────────
+// 快訊 TL;DR：指數方向 + 高重要性焦點
+// ─────────────────────────────────────────────
+function buildFlashTLDR(indexSnapshot, analyzed) {
+  const idxOrder = [['^GSPC', 'S&P'], ['^DJI', '道瓊'], ['^IXIC', '那指']];
+  const idxLine = idxOrder
+    .map(([sym, name]) => {
+      const idx = indexSnapshot.find(x => x.symbol === sym);
+      const pct = idx?.quote?.changePct;
+      if (pct == null) return null;
+      const dot = pct > 0.05 ? '🟢' : pct < -0.05 ? '🔴' : '⚪';
+      const sign = pct >= 0 ? '+' : '';
+      return `${dot} <b>${name}</b> <code>${sign}${pct.toFixed(2)}%</code>`;
+    })
+    .filter(Boolean)
+    .join('  ');
+
+  const vix = indexSnapshot.find(x => x.symbol === '^VIX');
+  const vixTag = vix?.quote?.price != null
+    ? `  📊 <b>VIX</b> <code>${vix.quote.price.toFixed(1)}</code>`
+    : '';
+
+  const hotStocks = (analyzed.stocks || []).filter(s => s.importance === 5);
+  const hotMarket = (analyzed.market || []).filter(s => s.importance === 5);
+  const totalCount = (analyzed.market?.length || 0) + (analyzed.stocks?.length || 0);
+  const hotCount   = hotStocks.length + hotMarket.length;
+
+  let focusLine = '';
+  if (hotStocks.length > 0) {
+    focusLine = `🔥 <b>焦點個股</b>　` + hotStocks.slice(0, 4)
+      .map(s => `<code>${s.symbol}</code>`).join(' · ');
+  } else if (hotMarket.length > 0) {
+    focusLine = `🔥 <b>焦點事件</b>　` + hotMarket.slice(0, 2)
+      .map(m => m.summary_zh).join(' · ');
+  } else {
+    focusLine = `<i>本期無 5 星級事件，皆為一般等級</i>`;
+  }
+
+  return `<b>💡 一眼看懂</b>\n` +
+    `${idxLine}${vixTag}\n` +
+    `⚡ 本期 <b>${totalCount}</b> 則重要新聞${hotCount > 0 ? `，其中 <b>${hotCount}</b> 則 🔥 高重要性` : ''}\n` +
+    `${focusLine}`;
+}
 function volumeRatio(vol, avg) {
   if (!vol || !avg || avg === 0) return null;
   return (vol / avg).toFixed(1);
@@ -1014,6 +1137,23 @@ function saveReportSnapshot(kind, sessionDate, payload) {
   } catch (e) { log('STATE', `寫入快照失敗（忽略）：${e.message}`); }
 }
 
+// 讀最近一份快照（kind: 'stock' | 'flash'）
+function loadLatestSnapshot(kind) {
+  try {
+    const dir = path.join(DATA_DIR, 'reports');
+    if (!fs.existsSync(dir)) return null;
+    const files = fs.readdirSync(dir)
+      .filter(f => f.endsWith(`-${kind}.json`))
+      .sort()
+      .reverse();
+    if (files.length === 0) return null;
+    return JSON.parse(fs.readFileSync(path.join(dir, files[0]), 'utf8'));
+  } catch (e) {
+    log('STATE', `讀取 ${kind} 快照失敗（忽略）：${e.message}`);
+    return null;
+  }
+}
+
 // ─────────────────────────────────────────────
 // 執行股市報告
 // ─────────────────────────────────────────────
@@ -1136,17 +1276,17 @@ async function runStockReport(force = false) {
       : '';
     const header = `<b>📈 美股日報</b>｜${sess.dateStr}（${sess.weekday}）收盤\n` +
       intradayNote +
-      `<code>${quickParts.join('  ')}</code>\n` +
-      `${'━'.repeat(24)}\n\n`;
+      `<code>${quickParts.join('  ')}</code>\n\n`;
+    const tldrSection = buildStockTLDR(marketData, breadth);
     const sources = ['GPT-4o', 'Yahoo Finance'];
     if (FINNHUB_KEY) sources.push('Finnhub');
     if (macroContext) sources.push('Perplexity');
     const coverageStr = `${coveragePct < 50 ? '⚠️ ' : ''}報價覆蓋 ${totalFetched}/${expectedCount}（${coveragePct}%）`;
-    const footer = `\n\n${'━'.repeat(24)}\n` +
+    const footer = `\n\n` +
       `<i>🤖 ${sources.join(' · ')}｜${coverageStr}</i>\n` +
       `<i>⏱ ${timeStr}（台北）發布 · 資料為 ${sessionLabel} 美股收盤 · 僅供參考，不構成投資建議</i>`;
     const programSection = '\n\n' + breadthSection + '\n\n' + rankingSection + (earningsSection ? '\n\n' + earningsSection : '');
-    const fullReport = header + report + programSection + footer;
+    const fullReport = header + tldrSection + '\n\n' + report + programSection + footer;
 
     const chunks = splitMessage(fullReport, MSG_LIMIT);
     log('STOCK', `發送 ${chunks.length} 段...`);
@@ -1171,6 +1311,7 @@ async function runStockReport(force = false) {
       quotes: [...marketData.mag7, ...Object.values(marketData.sectorStocks).flat()]
         .map(s => ({ symbol: s.symbol, name: s.name, price: s.quote?.price ?? null, changePct: s.quote?.changePct ?? null })),
       gptReport: report,
+      fullReport,
     });
 
     log('STOCK', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
@@ -1320,30 +1461,23 @@ ${stockText}`;
 // ─────────────────────────────────────────────
 // 組合快訊訊息（HTML，發送時轉 Slack Block Kit）
 // ─────────────────────────────────────────────
-function buildFlashMessage(analyzed, indexSnapshot = [], sessionDate = null) {
+function buildFlashMessage(analyzed, indexSnapshot = [], stockQuotes = {}, sessionDate = null) {
   const { timeStr } = fmtDateHeader();
   const sess = sessionDate ? fmtSessionDate(sessionDate) : null;
 
   const totalCount = analyzed.market.length + analyzed.stocks.length;
   let msg = sess
-    ? `<b>⚡ 美股新聞快訊</b>｜${sess.dateStr}（${sess.weekday}）盤後\n`
-    : `<b>⚡ 美股新聞快訊</b>\n`;
-  msg += `${'━'.repeat(24)}\n`;
+    ? `<b>⚡ 美股新聞快訊</b>｜${sess.dateStr}（${sess.weekday}）盤後\n\n`
+    : `<b>⚡ 美股新聞快訊</b>\n\n`;
 
-  // ── 指數快照 ──
-  if (indexSnapshot.length > 0) {
-    msg += '\n';
-    for (const { name, quote: q } of indexSnapshot) {
-      const emoji = q.changePct >= 0 ? '▲' : '▼';
-      msg += `${trendEmoji(q.changePct)} <b>${name}</b> <code>${fmt(q.price)}</code> ${emoji}<code>${Math.abs(q.changePct).toFixed(2)}%</code>\n`;
-    }
-  }
+  // ── TL;DR 一眼看懂 ──
+  msg += buildFlashTLDR(indexSnapshot, analyzed) + '\n\n';
 
   // ── 大盤事件 ──
-  msg += `\n<b>🌐 大盤事件</b>\n`;
+  msg += `<b>🌐 大盤事件</b>\n`;
   if (analyzed.market.length > 0) {
     for (const item of analyzed.market) {
-      const badge = item.importance === 5 ? '🔺' : '▸';
+      const badge = item.importance === 5 ? '🔥' : '⚡';
       msg += `${badge} <b>${item.summary_zh}</b>`;
       if (item.category) msg += `  <i>${item.category}</i>`;
       msg += '\n';
@@ -1352,13 +1486,15 @@ function buildFlashMessage(analyzed, indexSnapshot = [], sessionDate = null) {
     msg += `  <i>該交易日無重大總經或地緣事件</i>\n`;
   }
 
-  // ── 個股快訊 ──
+  // ── 個股快訊（附當日漲跌幅）──
   msg += `\n<b>📌 個股快訊</b>\n`;
   if (analyzed.stocks.length > 0) {
     const sorted = [...analyzed.stocks].sort((a, b) => b.importance - a.importance);
     for (const item of sorted) {
-      const badge = item.importance === 5 ? '🔺' : '▸';
-      msg += `${badge} <b>${item.name}</b>（<code>${item.symbol}</code>）`;
+      const badge = item.importance === 5 ? '🔥' : '⚡';
+      const q     = stockQuotes[item.symbol];
+      const pctTag = q?.changePct != null ? `  ${changeBadge(q.changePct)}` : '';
+      msg += `${badge} <b>${item.name}</b>（<code>${item.symbol}</code>）${pctTag}`;
       if (item.category) msg += `  <i>${item.category}</i>`;
       msg += `\n   ${item.summary_zh}\n`;
     }
@@ -1366,8 +1502,7 @@ function buildFlashMessage(analyzed, indexSnapshot = [], sessionDate = null) {
     msg += `  <i>該交易日池內個股無重大事件</i>\n`;
   }
 
-  msg += `\n${'━'.repeat(24)}\n`;
-  msg += `<i>⚡ ${totalCount} 則重要新聞 · ${timeStr}（台北）發布</i>\n`;
+  msg += `\n<i>⚡ ${totalCount} 則重要新聞 · ${timeStr}（台北）發布</i>\n`;
   msg += `<i>來源：Finnhub / Yahoo Finance · 僅供參考</i>`;
   return msg;
 }
@@ -1414,7 +1549,19 @@ async function runFlashReport(force = false) {
 
     // 附加指數快照
     const indexSnapshot = INDICES.map((s, i) => ({ ...s, quote: indexQuotes[i] })).filter(x => x.quote);
-    const message = buildFlashMessage(analyzed, indexSnapshot, sessionDate);
+
+    // 為「個股快訊」裡有提到的個股補抓當日報價，附在訊息上讓讀者直接看出利多/利空
+    const newsSymbols = [...new Set((analyzed.stocks || []).map(s => s.symbol).filter(Boolean))];
+    const stockQuotes = {};
+    if (newsSymbols.length > 0) {
+      log('FLASH', `抓取 ${newsSymbols.length} 支新聞個股的當日報價...`);
+      await batchParallel(newsSymbols, async sym => {
+        const q = await fetchQuote(sym);
+        if (q?.changePct != null) stockQuotes[sym] = q;
+      }, 5, 200);
+    }
+
+    const message = buildFlashMessage(analyzed, indexSnapshot, stockQuotes, sessionDate);
     const chunks  = splitMessage(message, MSG_LIMIT);
     for (let i = 0; i < chunks.length; i++) {
       await sendMessage(chunks[i]);
@@ -1425,8 +1572,10 @@ async function runFlashReport(force = false) {
     saveState();
     saveReportSnapshot('flash', sessionDate, {
       indexSnapshot: indexSnapshot.map(s => ({ symbol: s.symbol, name: s.name, price: s.quote?.price ?? null, changePct: s.quote?.changePct ?? null })),
+      stockQuotes:   Object.fromEntries(Object.entries(stockQuotes).map(([sym, q]) => [sym, { price: q.price, changePct: q.changePct }])),
       market: analyzed.market,
       stocks: analyzed.stocks,
+      fullReport: message,
     });
 
     log('FLASH', `✅ 完成，耗時 ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
@@ -1486,7 +1635,7 @@ let slackSocket = null;
 
 // 區段標題的 emoji（splitMessage / Block Kit header 用同一組）
 // 必須涵蓋所有「<b>{emoji} ...</b>」會出現的章節 emoji，否則切不到位、也不會升成 header block。
-const SECTION_EMOJIS = '📊📈🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡🟢❌🤖🏭📋🎮';
+const SECTION_EMOJIS = '📊📈🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡🟢❌🤖🏭📋🎮💡🔁';
 
 // ── HTML → Slack mrkdwn ──
 function htmlToMrkdwn(text) {
@@ -1621,17 +1770,28 @@ async function initSlack() {
   slackSocket.on('reconnecting',                () => log('SLACK', 'socket reconnecting...'));
   slackSocket.on('unable_to_socket_mode_start', e => log('SLACK', `❌ Socket Mode 啟動失敗：${e?.message || e}`));
 
-  // ── 斜線指令：/ping /stock /flash ──
+  // ── 斜線指令：/ping /stock /flash /help /today /last ──
   slackSocket.on('slash_commands', async ({ ack, body }) => {
     try {
       const cmd       = (body.command || '').toLowerCase();
       const channelId = body.channel_id;
       const userId    = body.user_id;
 
+      // /help 是「資訊查詢」，任何頻道（含 DM）都允許，以 ephemeral 回覆只給叫的人看
+      if (cmd === '/help') {
+        await ack({
+          response_type: 'ephemeral',
+          blocks: buildSlackBlocks(buildHelpMessage()),
+          text:   '指令說明',
+        });
+        log('SLACK', `斜線指令 ${cmd} from user ${userId}`);
+        return;
+      }
+
       if (channelId !== SLACK_CHANNEL_ID) {
         await ack({
           response_type: 'ephemeral',
-          text: `請到 <#${SLACK_CHANNEL_ID}> 使用此指令`,
+          text: `請到 <#${SLACK_CHANNEL_ID}> 使用此指令（或輸入 \`/help\` 查看用法）`,
         });
         return;
       }
@@ -1648,8 +1808,17 @@ async function initSlack() {
       } else if (cmd === '/flash') {
         await ack({ response_type: 'in_channel', text: '⏳ *美股新聞快訊* 生成中，請稍候...' });
         runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
+      } else if (cmd === '/today') {
+        await ack({
+          response_type: 'in_channel',
+          blocks: buildSlackBlocks(buildTodayMessage()),
+          text:   '今日摘要',
+        });
+      } else if (cmd === '/last') {
+        await ack({ response_type: 'in_channel', text: '🔁 重貼上次日報中...' });
+        replayLastReport().catch(e => log('SLACK', `/last 失敗: ${e.message}`));
       } else {
-        await ack({ response_type: 'ephemeral', text: `未知指令：${cmd}` });
+        await ack({ response_type: 'ephemeral', text: `未知指令：${cmd}（試試 \`/help\`）` });
       }
       log('SLACK', `斜線指令 ${cmd} from user ${userId}`);
     } catch (e) {
@@ -1659,7 +1828,7 @@ async function initSlack() {
   });
 
   await slackSocket.start();
-  log('SLACK', '✅ Socket Mode 已連線，斜線指令就緒（/ping /stock /flash）');
+  log('SLACK', '✅ Socket Mode 已連線，斜線指令就緒（/ping /stock /flash /help /today /last）');
 }
 
 async function sendSlack(text, retries = 3) {
@@ -1719,13 +1888,114 @@ function buildPingMessage() {
   const uptimeStr = uptime >= 3600
     ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
     : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
+  const lastStock = _state.lastStockSession || '—';
+  const lastFlash = _state.lastFlashSession || '—';
   return `<b>🟢 系統狀態</b>\n` +
     `  版本　 <code>${APP_VERSION}</code>\n` +
     `  平台　 <code>${PLATFORM}</code>\n` +
     `  狀態　 正常運作中\n` +
     `  記憶體 <code>${mem} MB</code>\n` +
     `  運行　 <code>${uptimeStr}</code>\n` +
+    `  上次日報 <code>${lastStock}</code> · 快訊 <code>${lastFlash}</code>\n` +
     `  時間　 ${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`;
+}
+
+// ── /help 訊息 ──
+function buildHelpMessage() {
+  return `<b>🎮 指令說明</b>\n` +
+    `<code>/ping</code> — 系統狀態（版本、記憶體、運行時間、上次推送）\n` +
+    `<code>/stock</code> — 立刻產出最近交易日的完整美股日報\n` +
+    `<code>/flash</code> — 立刻產出最近交易日的新聞快訊\n` +
+    `<code>/today</code> — 從 snapshot 快速看「今日 TL;DR」（不重跑，最快）\n` +
+    `<code>/last</code> — 從 snapshot 重貼上一次的完整日報\n` +
+    `<code>/help</code> — 顯示這份說明\n` +
+    `\n` +
+    `<b>📋 自動排程</b>（Asia/Taipei · 週一~週六）\n` +
+    `<code>07:30</code> 📈 美股日報　<code>07:35</code> ⚡ 美股新聞快訊\n` +
+    `\n` +
+    `<b>🎨 emoji 約定</b>\n` +
+    `🟢 漲 · 🔴 跌 · ⚪ 持平 · 🚀 暴漲 ≥+3% · 💥 暴跌 ≤-3%\n` +
+    `🔥 高重要性（5 星）· ⚡ 一般快訊（4 星）`;
+}
+
+// ── /today 訊息：從最新 snapshot 快速組 TL;DR ──
+function buildTodayMessage() {
+  const stock = loadLatestSnapshot('stock');
+  const flash = loadLatestSnapshot('flash');
+  if (!stock && !flash) {
+    return `<b>⚠️ 尚無 snapshot 可顯示</b>\n` +
+      `請先用 <code>/stock</code> 或 <code>/flash</code> 觸發報告，產出後此指令才有資料可呈現。`;
+  }
+
+  const parts = [`<b>📊 今日摘要</b>`];
+
+  if (stock) {
+    const sess = fmtSessionDate(stock.sessionDate);
+    parts.push(`\n<i>📈 美股日報 · ${sess.dateStr}（${sess.weekday}）</i>`);
+    const idxLine = [['^GSPC', 'S&P'], ['^DJI', '道瓊'], ['^IXIC', '那指']]
+      .map(([sym, name]) => {
+        const idx = (stock.indices || []).find(x => x.symbol === sym);
+        if (idx?.changePct == null) return null;
+        const dot = idx.changePct > 0.05 ? '🟢' : idx.changePct < -0.05 ? '🔴' : '⚪';
+        const sign = idx.changePct >= 0 ? '+' : '';
+        return `${dot} <b>${name}</b> <code>${sign}${idx.changePct.toFixed(2)}%</code>`;
+      })
+      .filter(Boolean)
+      .join('  ');
+    const vix = (stock.indices || []).find(x => x.symbol === '^VIX');
+    const vixTag = vix?.price != null ? `  📊 <b>VIX</b> <code>${vix.price.toFixed(1)}</code>` : '';
+    parts.push(`${idxLine}${vixTag}`);
+
+    const quotes = (stock.quotes || []).filter(q => q.changePct != null);
+    const sorted = [...quotes].sort((a, b) => b.changePct - a.changePct);
+    const top3 = sorted.slice(0, 3).map(s => `<code>${s.symbol}</code> ${changeBadge(s.changePct)}`).join('　');
+    const bot3 = sorted.slice(-3).reverse().map(s => `<code>${s.symbol}</code> ${changeBadge(s.changePct)}`).join('　');
+    parts.push(`🚀 <b>漲幅 TOP3</b>　${top3 || '<i>無</i>'}`);
+    parts.push(`💥 <b>跌幅 TOP3</b>　${bot3 || '<i>無</i>'}`);
+
+    const b = stock.breadth || {};
+    if (b.advancing != null && b.declining != null) {
+      parts.push(`<i>市場廣度：上漲 ${b.advancing} · 下跌 ${b.declining} · 持平 ${b.unchanged || 0}</i>`);
+    }
+  }
+
+  if (flash) {
+    const sess = fmtSessionDate(flash.sessionDate);
+    parts.push(`\n<i>⚡ 新聞快訊 · ${sess.dateStr}（${sess.weekday}）</i>`);
+    const hotStocks = (flash.stocks || []).filter(s => s.importance === 5);
+    const hotMarket = (flash.market || []).filter(m => m.importance === 5);
+    const totalCount = (flash.market?.length || 0) + (flash.stocks?.length || 0);
+    parts.push(`⚡ 本期 <b>${totalCount}</b> 則重要新聞${hotStocks.length + hotMarket.length > 0 ? `，其中 <b>${hotStocks.length + hotMarket.length}</b> 則 🔥` : ''}`);
+    if (hotMarket.length > 0) {
+      parts.push(`🔥 <b>大盤焦點</b>　` + hotMarket.slice(0, 3).map(m => m.summary_zh).join(' · '));
+    }
+    if (hotStocks.length > 0) {
+      parts.push(`🔥 <b>個股焦點</b>　` + hotStocks.slice(0, 4).map(s => `<code>${s.symbol}</code>`).join(' · '));
+    }
+  }
+
+  parts.push(`\n<i>📝 想看完整版？ <code>/stock</code> /  <code>/flash</code> 重新產出 · <code>/last</code> 重貼上次完整報告</i>`);
+  return parts.join('\n');
+}
+
+// ── /last 訊息：重貼上次完整日報 ──
+async function replayLastReport() {
+  const stock = loadLatestSnapshot('stock');
+  if (!stock?.fullReport && !stock?.gptReport) {
+    await sendMessage(`<b>⚠️ 尚無上一次完整日報可重貼</b>\n` +
+      `請先用 <code>/stock</code> 觸發產出，產出後 <code>/last</code> 才能重貼。`);
+    return;
+  }
+  const sess = fmtSessionDate(stock.sessionDate);
+  const body = stock.fullReport || stock.gptReport;
+  const header = `<b>🔁 重貼：${sess.dateStr}（${sess.weekday}）美股日報</b>\n` +
+    `<i>產出時間 ${stock.generatedAt}　·　此為 snapshot 重貼，未重新抓資料</i>\n\n`;
+  const full = header + body;
+  const chunks = splitMessage(full, MSG_LIMIT);
+  for (let i = 0; i < chunks.length; i++) {
+    await sendMessage(chunks[i]);
+    if (i < chunks.length - 1) await sleep(1200);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -1811,13 +2081,13 @@ async function main() {
 
   await sendMessage(
     `<b>🟢 Bot ${APP_VERSION} 已啟動</b>\n\n` +
-    `<b>📋 每日排程</b>（週一至週五）\n` +
+    `<b>📋 自動排程</b>（Asia/Taipei · 週一~週六）\n` +
     `  <code>07:30</code>  📈 美股日報\n` +
     `  <code>07:35</code>  ⚡ 美股新聞快訊\n\n` +
     `<b>🎮 指令</b>（Slack 斜線指令）\n` +
-    `  /ping — 系統狀態\n` +
-    `  /stock — 觸發美股日報\n` +
-    `  /flash — 觸發新聞快訊`
+    `  <code>/ping</code> — 系統狀態　<code>/help</code> — 用法說明\n` +
+    `  <code>/stock</code> — 觸發美股日報　<code>/flash</code> — 觸發新聞快訊\n` +
+    `  <code>/today</code> — 一眼看懂今日摘要　<code>/last</code> — 重貼上次日報`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');
