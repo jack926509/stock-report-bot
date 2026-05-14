@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// 美股日報 + 新聞快訊 機器人 v5.5（Telegram / Discord）
+// 美股日報 + 新聞快訊 機器人 v6.0（Slack）
 //
 // ─── 雙通報架構 ─────────────────────────────────────────
 //  📊 訊息一：美股日報（07:30，週一至週五）
@@ -63,6 +63,12 @@
 //  ✅ 報告 footer 揭露報價覆蓋率；盤中手動觸發加警告
 //  ✅ 同一交易日重複觸發自動去重（手動 /stock 與 RUN_NOW 不受限）
 //  ✅ 新增本地狀態檔與每日快照（STATE_DIR，預設 ./data）
+//
+// ─── v6.0 改善 ──────────────────────────────────────────
+//  ✅ 訊息平台改為 Slack（@slack/web-api + @slack/socket-mode）
+//  ✅ 移除 Telegram / Discord 相關程式碼與依賴
+//  ✅ 報告以 Block Kit 呈現（header + section + divider）
+//  ✅ 斜線指令 /ping /stock /flash 走 Socket Mode（不需公開 URL）
 // ═══════════════════════════════════════════════════════════
 
 'use strict';
@@ -79,24 +85,16 @@ const { runAgentsForSymbols, formatAgentSignals } = require('./agents/index');
 const { fetchMacroContext, fetchStockCatalyst } = require('./agents/perplexity');
 
 // ─────────────────────────────────────────────
-// 訊息平台選擇（telegram / discord）
+// 訊息平台：Slack
 // ─────────────────────────────────────────────
-// 優先看 MESSAGING_PLATFORM；未設定時，若有 DISCORD_BOT_TOKEN 則用 discord，否則 telegram
-const PLATFORM = (process.env.MESSAGING_PLATFORM
-  || (process.env.DISCORD_BOT_TOKEN ? 'discord' : 'telegram')).toLowerCase();
+const PLATFORM = 'slack';
 
 // ─────────────────────────────────────────────
 // 環境變數驗證
 // ─────────────────────────────────────────────
 function validateEnv() {
-  const missing = ['OPENAI_API_KEY'].filter(v => !process.env[v]);
-  if (PLATFORM === 'discord') {
-    if (!process.env.DISCORD_BOT_TOKEN)  missing.push('DISCORD_BOT_TOKEN');
-    if (!process.env.DISCORD_CHANNEL_ID) missing.push('DISCORD_CHANNEL_ID');
-  } else {
-    if (!process.env.TELEGRAM_BOT_TOKEN) missing.push('TELEGRAM_BOT_TOKEN');
-    if (!process.env.TELEGRAM_CHAT_ID)   missing.push('TELEGRAM_CHAT_ID');
-  }
+  const missing = ['OPENAI_API_KEY', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_CHANNEL_ID']
+    .filter(v => !process.env[v]);
   if (missing.length > 0) {
     console.error(`❌ 缺少必要的環境變數（平台：${PLATFORM}）：${missing.join(', ')}`);
     process.exit(1);
@@ -108,21 +106,17 @@ function validateEnv() {
 
 validateEnv();
 
-const OPENAI_KEY  = process.env.OPENAI_API_KEY;
-const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
-const DISCORD_TOKEN      = process.env.DISCORD_BOT_TOKEN;
-const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID || null; // 設定後斜線指令即時生效（建議單伺服器使用）
-const FINNHUB_KEY = process.env.FINNHUB_API_KEY || null;
-const TIMEZONE    = 'Asia/Taipei';
-const APP_VERSION = 'v5.5';
+const OPENAI_KEY        = process.env.OPENAI_API_KEY;
+const SLACK_BOT_TOKEN   = process.env.SLACK_BOT_TOKEN;
+const SLACK_APP_TOKEN   = process.env.SLACK_APP_TOKEN;
+const SLACK_CHANNEL_ID  = process.env.SLACK_CHANNEL_ID;
+const FINNHUB_KEY       = process.env.FINNHUB_API_KEY || null;
+const TIMEZONE          = 'Asia/Taipei';
+const APP_VERSION       = 'v6.0';
 
-// Discord：是否啟用 ! 前綴訊息指令（需開 MESSAGE CONTENT INTENT）；純斜線指令可設為 false
-const DISCORD_ENABLE_PREFIX_COMMANDS = process.env.DISCORD_ENABLE_PREFIX_COMMANDS !== 'false';
-
-// 各平台單則訊息字數上限（保留安全邊界）：Telegram 4096 / Discord 2000
-const MSG_LIMIT = PLATFORM === 'discord' ? 1900 : 3800;
+// 切分訊息用的字數上限：Slack 單則 chat.postMessage text 上限約 40000、單一 section block 文字 3000。
+// 為了讓多區段一次成圖（一則訊息一段報告），這裡設高一點，由 Block Kit 內部再分塊處理。
+const MSG_LIMIT = 12000;
 
 const STOCK_SCHEDULE = '30 7 * * 1-5';
 const FLASH_SCHEDULE = '35 7 * * 1-5';
@@ -794,7 +788,7 @@ ${breadthText}
 
 === 排版規範 ===
 - 語言：繁體中文
-- 格式：只用 Telegram HTML（<b> <i> <code>），禁止 Markdown 語法
+- 格式：只用 HTML 標籤（<b> <i> <code>），禁止 Markdown 語法
 - 直接輸出報告本文，不加說明前言
 - 每個章節標題獨佔一行，標題後空一行再寫內容
 - 章節之間空一行，保持閱讀節奏
@@ -1324,7 +1318,7 @@ ${stockText}`;
 }
 
 // ─────────────────────────────────────────────
-// 組合快訊 Telegram 訊息
+// 組合快訊訊息（HTML，發送時轉 Slack Block Kit）
 // ─────────────────────────────────────────────
 function buildFlashMessage(analyzed, indexSnapshot = [], sessionDate = null) {
   const { timeStr } = fmtDateHeader();
@@ -1459,7 +1453,7 @@ async function callOpenAI(prompt, model = 'gpt-4o', maxTokens = 2000, retries = 
           {
             role: 'system',
             content: model === 'gpt-4o'
-              ? '你是資深美股分析師，精通 Telegram HTML 排版。只用 <b><i><code> 標籤，禁止 Markdown。數字引用真實數據。'
+              ? '你是資深美股分析師，精通 HTML 排版。只用 <b><i><code> 標籤，禁止 Markdown。數字引用真實數據。'
               : '你是 AI 新聞分析師，只回傳純 JSON，不要任何其他文字。',
           },
           { role: 'user', content: prompt }
@@ -1477,179 +1471,214 @@ async function callOpenAI(prompt, model = 'gpt-4o', maxTokens = 2000, retries = 
 }
 
 // ═══════════════════════════════════════════════════════════
-// 訊息平台抽象層（Telegram / Discord）
+// 訊息平台抽象層（Slack）
 // ═══════════════════════════════════════════════════════════
 // 對外 API：
-//   sendMessage(text)        — 送一則訊息（自動依平台轉換格式並重試）
-//   splitMessage(text, max)  — 把長訊息切成多段（沿用原本 <b> 區段切點）
-// 報告內容統一用「Telegram HTML」撰寫（<b> <i> <code>），Discord 模式會即時轉成 Markdown。
+//   sendMessage(text)        — 送一則訊息（自動轉 Block Kit、附 plain_text fallback、重試）
+//   splitMessage(text, max)  — 把長訊息切成多段（沿用 <b>{emoji}...</b> 區段切點）
+// 報告內容仍以 HTML 風格撰寫（<b> <i> <code>），這層會自動轉成 Slack mrkdwn / Block Kit。
 
-// ── HTML → Discord Markdown ──
-function htmlToDiscord(text) {
-  return text
-    .replace(/<\/?(b|strong)>/g, '**')
-    .replace(/<\/?(i|em)>/g, '*')
+const { WebClient }        = require('@slack/web-api');
+const { SocketModeClient } = require('@slack/socket-mode');
+
+let slackWeb    = null;
+let slackSocket = null;
+
+// 區段標題的 emoji（splitMessage / Block Kit header 用同一組）
+const SECTION_EMOJIS = '📊🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡🟢❌';
+
+// ── HTML → Slack mrkdwn ──
+function htmlToMrkdwn(text) {
+  // Slack 連結語法本身用 < >，必須先把 <a> 抽掉成 placeholder，最後再放回，
+  // 否則最後一輪「移除殘餘 HTML tag」會把 <url|text> 也吃掉。
+  const links = [];
+  let out = text.replace(/<a\s+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g, (_m, url, txt) => {
+    links.push({ url, txt: htmlToPlain(txt) });
+    return `\x00LINK${links.length - 1}\x00`;
+  });
+
+  out = out
+    .replace(/<pre>([\s\S]*?)<\/pre>/g, (_m, code) => '```\n' + code + '\n```')
     .replace(/<code>([\s\S]*?)<\/code>/g, '`$1`')
-    .replace(/<pre>([\s\S]*?)<\/pre>/g, '```\n$1\n```')
-    .replace(/<a\s+href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g, '[$2]($1)')
+    .replace(/<\/?(b|strong)>/g, '*')
+    .replace(/<\/?(i|em)>/g, '_')
+    .replace(/<\/?br\s*\/?>/g, '\n')
+    // 殘餘 HTML tag 全部脫除
+    .replace(/<[^>]+>/g, '')
+    // Slack mrkdwn 中 & < > 需逃逸（連結 placeholder 暫未還原，不會被誤吃）
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // 放回 Slack 連結
+  out = out.replace(/\x00LINK(\d+)\x00/g, (_m, i) => {
+    const { url, txt } = links[Number(i)];
+    return `<${url}|${txt}>`;
+  });
+
+  return out;
+}
+
+// HTML → 純文字（給 header block / fallback 用）
+function htmlToPlain(text) {
+  return text
     .replace(/<[^>]+>/g, '')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
 }
 
-// ── Telegram ──
-function sendRawTelegram(text, parseMode = 'HTML') {
-  return new Promise((resolve, reject) => {
-    const payload = { chat_id: CHAT_ID, text };
-    if (parseMode) payload.parse_mode = parseMode;
-    const body = JSON.stringify(payload);
-    const req  = https.request({
-      hostname: 'api.telegram.org',
-      path:     `/bot${BOT_TOKEN}/sendMessage`,
-      method:   'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const r = JSON.parse(data);
-          if (r.ok) resolve({ ok: true, messageId: r.result?.message_id });
-          else reject(new Error(`${r.error_code}: ${r.description}`));
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
-}
-
-async function sendTelegram(text, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await sendRawTelegram(text, 'HTML');
-    } catch (err) {
-      // HTML 解析失敗 → 降級純文字（不重試）
-      if (err.message.includes("can't parse") || err.message.includes('Bad Request')) {
-        log('TG', '⚠️ HTML 失敗，降級純文字');
-        return await sendRawTelegram(text.replace(/<[^>]+>/g, ''), null);
-      }
-      // 網路/限速錯誤 → 指數退避重試
-      if (attempt < retries) {
-        const delay = attempt * 2000;
-        log('TG', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
-        await sleep(delay);
-      } else {
-        log('TG', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
-        throw err;
-      }
-    }
-  }
-}
-
-// ── Discord ──
-let discordClient  = null;
-let discordChannel = null;
-
-async function initDiscord() {
-  const { Client, GatewayIntentBits, Partials, MessageFlags } = require('discord.js');
-  const intents = [GatewayIntentBits.Guilds];
-  if (DISCORD_ENABLE_PREFIX_COMMANDS) {
-    // ! 前綴指令需要讀訊息內容（MESSAGE CONTENT 為 privileged intent，須在開發者後台開啟）
-    intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
-  }
-  discordClient = new Client({ intents, partials: [Partials.Channel] });
-  discordClient.on('error', e => log('DISCORD', `client error: ${e.message}`));
-  discordClient.on('warn',  m => log('DISCORD', `warn: ${m}`));
-
-  await discordClient.login(DISCORD_TOKEN);
-  if (!discordClient.isReady()) {
-    await new Promise(resolve => discordClient.once('ready', resolve));
-  }
-  discordChannel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-  if (!discordChannel || typeof discordChannel.send !== 'function') {
-    throw new Error(`DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID} 不是可發送訊息的文字頻道`);
-  }
-  log('DISCORD', `✅ 已登入 ${discordClient.user.tag}，目標頻道 #${discordChannel.name || DISCORD_CHANNEL_ID}`);
-
-  // ── 註冊原生斜線指令（/ping /stock /flash）──
-  const slashCommands = [
-    { name: 'ping',  description: '系統狀態（版本、平台、記憶體、運行時間）' },
-    { name: 'stock', description: '手動觸發美股日報' },
-    { name: 'flash', description: '手動觸發美股新聞快訊' },
-  ];
-  try {
-    if (DISCORD_GUILD_ID) {
-      const guild = await discordClient.guilds.fetch(DISCORD_GUILD_ID);
-      await guild.commands.set(slashCommands);
-      log('DISCORD', `✅ 已註冊 ${slashCommands.length} 個伺服器斜線指令（guild ${DISCORD_GUILD_ID}，即時生效）`);
+// 把長字串依「行」切成 <= maxLen 的多段（單一 section block 文字上限 3000）
+function chunkTextByLine(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const lines  = text.split('\n');
+  const chunks = [];
+  let cur = '';
+  for (const line of lines) {
+    const candidate = cur ? cur + '\n' + line : line;
+    if (candidate.length <= maxLen) {
+      cur = candidate;
     } else {
-      await discordClient.application.commands.set(slashCommands);
-      log('DISCORD', `✅ 已註冊 ${slashCommands.length} 個全域斜線指令（最多約 1 小時生效；設定 DISCORD_GUILD_ID 可即時生效）`);
+      if (cur) chunks.push(cur);
+      if (line.length > maxLen) {
+        for (let i = 0; i < line.length; i += maxLen) chunks.push(line.slice(i, i + maxLen));
+        cur = '';
+      } else {
+        cur = line;
+      }
     }
-  } catch (e) {
-    log('DISCORD', `⚠️ 斜線指令註冊失敗（重啟可重試；若有開前綴指令仍可用）：${e.message}`);
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
+// HTML 報告文字 → Block Kit blocks
+function buildSlackBlocks(text) {
+  const SECTION_RE = new RegExp(`(?=\\n?<b>[${SECTION_EMOJIS}])`, 'g');
+  const pieces = text.split(SECTION_RE).map(s => s.trim()).filter(Boolean);
+  const blocks = [];
+
+  for (let i = 0; i < pieces.length; i++) {
+    if (blocks.length >= 50) break;
+    if (i > 0 && blocks.length < 49) blocks.push({ type: 'divider' });
+    if (blocks.length >= 50) break;
+
+    const piece = pieces[i];
+    const titleMatch = piece.match(/^<b>([^<]*)<\/b>\s*\n?([\s\S]*)$/);
+    let body;
+    if (titleMatch) {
+      const title = htmlToPlain(titleMatch[1]).slice(0, 150);
+      blocks.push({
+        type: 'header',
+        text: { type: 'plain_text', text: title, emoji: true },
+      });
+      body = titleMatch[2];
+    } else {
+      body = piece;
+    }
+    const mrkdwn = htmlToMrkdwn(body).replace(/━+/g, '').trim();
+    if (!mrkdwn) continue;
+    for (const chunk of chunkTextByLine(mrkdwn, 2900)) {
+      if (blocks.length >= 50) break;
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: chunk },
+      });
+    }
   }
 
-  // ── 斜線指令處理 ──
-  discordClient.on('interactionCreate', async (interaction) => {
+  if (blocks.length === 0) {
+    const mrkdwn = htmlToMrkdwn(text).trim();
+    if (mrkdwn) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: mrkdwn.slice(0, 2900) } });
+  }
+
+  return blocks.slice(0, 50);
+}
+
+async function initSlack() {
+  slackWeb = new WebClient(SLACK_BOT_TOKEN);
+
+  // 驗證 bot token + 頻道
+  try {
+    const auth = await slackWeb.auth.test();
+    log('SLACK', `✅ 已認證 bot ${auth.user} @ ${auth.team}`);
+  } catch (e) {
+    throw new Error(`SLACK_BOT_TOKEN 驗證失敗：${e.data?.error || e.message}`);
+  }
+  try {
+    const info = await slackWeb.conversations.info({ channel: SLACK_CHANNEL_ID });
+    log('SLACK', `✅ 目標頻道 #${info.channel?.name || SLACK_CHANNEL_ID}`);
+  } catch (e) {
+    log('SLACK', `⚠️ 取得頻道資訊失敗（仍嘗試發送）：${e.data?.error || e.message}`);
+  }
+
+  slackSocket = new SocketModeClient({ appToken: SLACK_APP_TOKEN });
+  slackSocket.on('error',        e => log('SLACK', `socket error: ${e.message || e}`));
+  slackSocket.on('disconnect',   () => log('SLACK', 'socket disconnected'));
+  slackSocket.on('connected',    () => log('SLACK', 'socket connected'));
+
+  // ── 斜線指令：/ping /stock /flash ──
+  slackSocket.on('slash_commands', async ({ ack, body }) => {
     try {
-      if (!interaction.isChatInputCommand()) return;
-      if (interaction.channelId && String(interaction.channelId) !== String(DISCORD_CHANNEL_ID)) {
-        await interaction.reply({ content: `請到 <#${DISCORD_CHANNEL_ID}> 使用此指令`, flags: MessageFlags.Ephemeral });
+      const cmd       = (body.command || '').toLowerCase();
+      const channelId = body.channel_id;
+      const userId    = body.user_id;
+
+      if (channelId !== SLACK_CHANNEL_ID) {
+        await ack({
+          response_type: 'ephemeral',
+          text: `請到 <#${SLACK_CHANNEL_ID}> 使用此指令`,
+        });
         return;
       }
-      if (interaction.commandName === 'ping') {
-        await interaction.reply(htmlToDiscord(buildPingMessage()).slice(0, 2000));
-      } else if (interaction.commandName === 'stock') {
-        await interaction.reply('⏳ **美股日報**生成中，請稍候...');
+
+      if (cmd === '/ping') {
+        await ack({
+          response_type: 'in_channel',
+          blocks: buildSlackBlocks(buildPingMessage()),
+          text:   '系統狀態',
+        });
+      } else if (cmd === '/stock') {
+        await ack({ response_type: 'in_channel', text: '⏳ *美股日報* 生成中，請稍候...' });
         runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
-      } else if (interaction.commandName === 'flash') {
-        await interaction.reply('⏳ **美股新聞快訊**生成中，請稍候...');
+      } else if (cmd === '/flash') {
+        await ack({ response_type: 'in_channel', text: '⏳ *美股新聞快訊* 生成中，請稍候...' });
         runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
+      } else {
+        await ack({ response_type: 'ephemeral', text: `未知指令：${cmd}` });
       }
-    } catch (e) { log('DISCORD', `斜線指令處理錯誤: ${e.message}`); }
+      log('SLACK', `斜線指令 ${cmd} from user ${userId}`);
+    } catch (e) {
+      log('SLACK', `斜線指令處理錯誤: ${e.message}`);
+      try { await ack({ response_type: 'ephemeral', text: `❌ 指令處理失敗：${e.message}` }); } catch {}
+    }
   });
 
-  // ── ! 前綴訊息指令（可選；需 MESSAGE CONTENT INTENT，設 DISCORD_ENABLE_PREFIX_COMMANDS=false 可關閉）──
-  if (DISCORD_ENABLE_PREFIX_COMMANDS) {
-    discordClient.on('messageCreate', async (m) => {
-      try {
-        if (m.author?.bot) return;
-        if (String(m.channelId) !== String(DISCORD_CHANNEL_ID)) return;
-        const cmd = m.content.trim().toLowerCase();
-        if (cmd === '!ping') {
-          await sendMessage(buildPingMessage());
-        } else if (cmd === '!stock') {
-          await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
-          runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
-        } else if (cmd === '!flash') {
-          await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
-          runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
-        }
-      } catch (e) { log('DISCORD', `指令處理錯誤: ${e.message}`); }
-    });
-    log('DISCORD', '✅ ! 前綴指令已啟用（需 MESSAGE CONTENT INTENT）');
-  } else {
-    log('DISCORD', 'ℹ️ ! 前綴指令已停用，僅使用斜線指令');
-  }
+  await slackSocket.start();
+  log('SLACK', '✅ Socket Mode 已連線，斜線指令就緒（/ping /stock /flash）');
 }
 
-async function sendDiscord(text, retries = 3) {
-  const content = htmlToDiscord(text).slice(0, 2000);
+async function sendSlack(text, retries = 3) {
+  if (!slackWeb) throw new Error('Slack Web client 尚未就緒');
+  const blocks   = buildSlackBlocks(text);
+  const fallback = htmlToPlain(text).slice(0, 3000);
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      if (!discordChannel) throw new Error('Discord 頻道尚未就緒');
-      return await discordChannel.send({ content, allowedMentions: { parse: [] } });
+      return await slackWeb.chat.postMessage({
+        channel:      SLACK_CHANNEL_ID,
+        text:         fallback,
+        blocks,
+        unfurl_links: false,
+        unfurl_media: false,
+      });
     } catch (err) {
+      const errCode = err?.data?.error || err.message;
       if (attempt < retries) {
         const delay = attempt * 2000;
-        log('DISCORD', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${err.message}`);
+        log('SLACK', `⚠️ 發送失敗（第 ${attempt} 次），${delay / 1000}s 後重試：${errCode}`);
         await sleep(delay);
       } else {
-        log('DISCORD', `❌ 發送失敗（已重試 ${retries} 次）：${err.message}`);
+        log('SLACK', `❌ 發送失敗（已重試 ${retries} 次）：${errCode}`);
         throw err;
       }
     }
@@ -1658,12 +1687,12 @@ async function sendDiscord(text, retries = 3) {
 
 // ── 統一發送入口 ──
 async function sendMessage(text, retries = 3) {
-  return PLATFORM === 'discord' ? sendDiscord(text, retries) : sendTelegram(text, retries);
+  return sendSlack(text, retries);
 }
 
 function splitMessage(text, maxLen = MSG_LIMIT) {
   if (text.length <= maxLen) return [text];
-  const SECTION_RE = /(?=\n<b>[📊🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡])/g;
+  const SECTION_RE = new RegExp(`(?=\\n<b>[${SECTION_EMOJIS}])`, 'g');
   const sections   = text.split(SECTION_RE);
   const chunks     = [];
   let current      = '';
@@ -1679,7 +1708,7 @@ function splitMessage(text, maxLen = MSG_LIMIT) {
   return chunks;
 }
 
-// ── /ping 訊息（Telegram & Discord 共用）──
+// ── /ping 訊息 ──
 function buildPingMessage() {
   const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
   const uptime = Math.floor(process.uptime());
@@ -1687,55 +1716,12 @@ function buildPingMessage() {
     ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`
     : `${Math.floor(uptime / 60)}m ${uptime % 60}s`;
   return `<b>🟢 系統狀態</b>\n` +
-    `${'━'.repeat(20)}\n` +
     `  版本　 <code>${APP_VERSION}</code>\n` +
     `  平台　 <code>${PLATFORM}</code>\n` +
     `  狀態　 正常運作中\n` +
     `  記憶體 <code>${mem} MB</code>\n` +
     `  運行　 <code>${uptimeStr}</code>\n` +
     `  時間　 ${new Date().toLocaleString('zh-TW', { timeZone: TIMEZONE })}`;
-}
-
-// ─────────────────────────────────────────────
-// Telegram 指令監聽（polling）
-// ─────────────────────────────────────────────
-async function startPolling() {
-  let offset = 0;
-  log('POLL', '開始監聽指令...');
-  while (true) {
-    try {
-      const updates = await getUpdates(offset);
-      for (const upd of updates) {
-        offset = upd.update_id + 1;
-        const text   = upd.message?.text || '';
-        const chatId = String(upd.message?.chat?.id || '');
-        if (chatId !== CHAT_ID) continue;
-        if (text === '/ping') {
-          await sendMessage(buildPingMessage());
-        } else if (text === '/stock') {
-          await sendMessage('⏳ <b>美股日報</b>生成中，請稍候...');
-          runStockReport(true).catch(e => log('STOCK', `手動失敗: ${e.message}`));
-        } else if (text === '/flash') {
-          await sendMessage('⏳ <b>美股新聞快訊</b>生成中，請稍候...');
-          runFlashReport(true).catch(e => log('FLASH', `手動失敗: ${e.message}`));
-        }
-      }
-    } catch (e) { log('POLL', `polling 錯誤: ${e.message}`); }
-    await sleep(3000);
-  }
-}
-
-function getUpdates(offset) {
-  return new Promise((resolve) => {
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&timeout=25`;
-    https.get(url, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data).result || []); } catch { resolve([]); }
-      });
-    }).on('error', () => resolve([]));
-  });
 }
 
 // ─────────────────────────────────────────────
@@ -1785,7 +1771,7 @@ async function gracefulShutdown(signal) {
     await sleep(3000);
   }
 
-  if (discordClient) { try { await discordClient.destroy(); } catch {} }
+  if (slackSocket) { try { await slackSocket.disconnect(); } catch {} }
 
   log('MAIN', '👋 Bot 已關閉');
   process.exit(0);
@@ -1817,25 +1803,17 @@ async function main() {
   startWatchdog();
   startHealthServer();
 
-  if (PLATFORM === 'discord') {
-    await initDiscord();
-  } else {
-    startPolling();
-  }
+  await initSlack();
 
-  const cmdHint = PLATFORM === 'discord'
-    ? (DISCORD_ENABLE_PREFIX_COMMANDS ? '/ 或 !' : '/')
-    : '/';
   await sendMessage(
-    `<b>🟢 Bot ${APP_VERSION} 已啟動</b>\n` +
-    `${'━'.repeat(20)}\n\n` +
+    `<b>🟢 Bot ${APP_VERSION} 已啟動</b>\n\n` +
     `<b>📋 每日排程</b>（週一至週五）\n` +
     `  <code>07:30</code>  📈 美股日報\n` +
     `  <code>07:35</code>  ⚡ 美股新聞快訊\n\n` +
-    `<b>🎮 指令</b>（前綴 ${cmdHint}）\n` +
-    `  ping — 系統狀態\n` +
-    `  stock — 觸發美股日報\n` +
-    `  flash — 觸發新聞快訊`
+    `<b>🎮 指令</b>（Slack 斜線指令）\n` +
+    `  /ping — 系統狀態\n` +
+    `  /stock — 觸發美股日報\n` +
+    `  /flash — 觸發新聞快訊`
   );
 
   log('MAIN', '✅ 所有服務啟動完成，等待排程中...');

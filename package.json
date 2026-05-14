@@ -1,13 +1,14 @@
 {
   "name": "stock-report-bot",
-  "version": "5.5.0",
-  "description": "美股日報 + 新聞快訊機器人 — Yahoo Finance / Finnhub / GPT-4o / Telegram 或 Discord",
+  "version": "6.0.0",
+  "description": "美股日報 + 新聞快訊機器人 — Yahoo Finance / Finnhub / GPT-4o / Slack",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.26.4",
+    "@slack/socket-mode": "^2.0.2",
+    "@slack/web-api": "^7.8.0",
     "node-cron": "^3.0.3",
     "openai": "^4.77.0",
     "yahoo-finance2": "^3.3.0"
