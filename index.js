@@ -1485,7 +1485,8 @@ let slackWeb    = null;
 let slackSocket = null;
 
 // 區段標題的 emoji（splitMessage / Block Kit header 用同一組）
-const SECTION_EMOJIS = '📊🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡🟢❌';
+// 必須涵蓋所有「<b>{emoji} ...</b>」會出現的章節 emoji，否則切不到位、也不會升成 header block。
+const SECTION_EMOJIS = '📊📈🔮🏆🔥📅📰🔄🎯⚠️🗞️🌐📌⚡🟢❌🤖🏭📋🎮';
 
 // ── HTML → Slack mrkdwn ──
 function htmlToMrkdwn(text) {
@@ -1554,7 +1555,8 @@ function chunkTextByLine(text, maxLen) {
 
 // HTML 報告文字 → Block Kit blocks
 function buildSlackBlocks(text) {
-  const SECTION_RE = new RegExp(`(?=\\n?<b>[${SECTION_EMOJIS}])`, 'g');
+  // 'u' flag 讓 emoji（含高位面字元）被當成單一 codepoint 而不是代理對拆兩半
+  const SECTION_RE = new RegExp(`(?=\\n?<b>[${SECTION_EMOJIS}])`, 'gu');
   const pieces = text.split(SECTION_RE).map(s => s.trim()).filter(Boolean);
   const blocks = [];
 
@@ -1613,9 +1615,11 @@ async function initSlack() {
   }
 
   slackSocket = new SocketModeClient({ appToken: SLACK_APP_TOKEN });
-  slackSocket.on('error',        e => log('SLACK', `socket error: ${e.message || e}`));
-  slackSocket.on('disconnect',   () => log('SLACK', 'socket disconnected'));
-  slackSocket.on('connected',    () => log('SLACK', 'socket connected'));
+  slackSocket.on('error',                       e => log('SLACK', `socket error: ${e?.message || e}`));
+  slackSocket.on('connected',                   () => log('SLACK', 'socket connected'));
+  slackSocket.on('disconnected',                () => log('SLACK', 'socket disconnected'));
+  slackSocket.on('reconnecting',                () => log('SLACK', 'socket reconnecting...'));
+  slackSocket.on('unable_to_socket_mode_start', e => log('SLACK', `❌ Socket Mode 啟動失敗：${e?.message || e}`));
 
   // ── 斜線指令：/ping /stock /flash ──
   slackSocket.on('slash_commands', async ({ ack, body }) => {
@@ -1692,7 +1696,7 @@ async function sendMessage(text, retries = 3) {
 
 function splitMessage(text, maxLen = MSG_LIMIT) {
   if (text.length <= maxLen) return [text];
-  const SECTION_RE = new RegExp(`(?=\\n<b>[${SECTION_EMOJIS}])`, 'g');
+  const SECTION_RE = new RegExp(`(?=\\n<b>[${SECTION_EMOJIS}])`, 'gu');
   const sections   = text.split(SECTION_RE);
   const chunks     = [];
   let current      = '';
